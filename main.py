@@ -942,8 +942,13 @@ def train_model(material_name):
             transformer_model.eval();
             pinn_model.eval()
             with torch.no_grad():
-                feats = transformer_model(val_dataset.strain_series)
-                Xc = torch.cat([feats, val_dataset.epsilon_a, val_dataset.gamma_a, val_dataset.FP], dim=1)
+                feats = transformer_model(val_dataset.strain_series.to(device))
+                Xc = torch.cat([
+                    feats,
+                    val_dataset.epsilon_a.to(device),
+                    val_dataset.gamma_a.to(device),
+                    val_dataset.FP.to(device)
+                ], dim=1)
                 preds, _ = pinn_model(Xc)
 
             # detach & cpu -> numpy
@@ -981,7 +986,7 @@ def train_model(material_name):
             # ---------------- 子图4: 对数误差分布 ----------------
             plt.subplot(2, 2, 4)
             # 计算对数误差并 detach、cpu、flatten
-            errs = torch.abs(torch.log10(preds) - torch.log10(val_dataset.Nf))
+            errs = torch.abs(torch.log10(preds) - torch.log10(val_dataset.Nf.to(device)))
             errs_np = errs.detach().cpu().numpy().flatten()
 
             # 只传入一维数组，去掉多余的 color 参数
