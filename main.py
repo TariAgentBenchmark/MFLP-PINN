@@ -21,7 +21,15 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, accuracy_score
 from torch.utils.data import DataLoader
 
-
+# ----------------------------
+# 设备配置
+# ----------------------------
+# 优先使用 GPU，如果有的话
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
+if torch.cuda.is_available():
+    print(f"GPU 设备名称: {torch.cuda.get_device_name()}")
+    print(f"GPU 内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
 
 # ----------------------------
@@ -745,11 +753,11 @@ def train_model(material_name):
     d_model    = 64   # Transformer隐藏维度
     nhead      = 4    # 注意力头数
     num_layers = 2    # 编码层数
-    transformer_model = TransformerFeatureExtractor(input_size, d_model, nhead, num_layers, dropout=0.1)
+    transformer_model = TransformerFeatureExtractor(input_size, d_model, nhead, num_layers, dropout=0.1).to(device)
 
     pinn_input_size = d_model + 3  # Transformer特征 + εₐ + γₐ + FP
     hidden_layers   = [64, 128, 64, 32]
-    pinn_model      = MFLP_PINN(pinn_input_size, hidden_layers, dropout=0.1)
+    pinn_model      = MFLP_PINN(pinn_input_size, hidden_layers, dropout=0.1).to(device)
 
     # 优化器 & 学习率调度
     optimizer = optim.AdamW(
@@ -794,6 +802,14 @@ def train_model(material_name):
         t_loss = d_loss = p_loss = m_loss = 0.0
 
         for X_seq, eps, gam, Nf, FPv, mech_lbl in train_loader:
+            # 移动数据到指定设备
+            X_seq = X_seq.to(device)
+            eps = eps.to(device)
+            gam = gam.to(device)
+            Nf = Nf.to(device)
+            FPv = FPv.to(device)
+            mech_lbl = mech_lbl.to(device)
+
             optimizer.zero_grad()
             feats = transformer_model(X_seq)
             Xc    = torch.cat([feats, eps, gam, FPv], dim=1)
@@ -832,6 +848,14 @@ def train_model(material_name):
         v_loss = vd_loss = vp_loss = vm_loss = 0.0
         with torch.no_grad():
             for X_seq, eps, gam, Nf, FPv, mech_lbl in val_loader:
+                # 移动数据到指定设备
+                X_seq = X_seq.to(device)
+                eps = eps.to(device)
+                gam = gam.to(device)
+                Nf = Nf.to(device)
+                FPv = FPv.to(device)
+                mech_lbl = mech_lbl.to(device)
+
                 feats = transformer_model(X_seq)
                 Xc    = torch.cat([feats, eps, gam, FPv], dim=1)
                 pred_life, pred_mech = pinn_model(Xc)
@@ -986,6 +1010,14 @@ def train_model(material_name):
 
     with torch.no_grad():
         for X_seq, eps, gam, Nf, FPv, mech_lbl in test_loader:
+            # 移动数据到指定设备
+            X_seq = X_seq.to(device)
+            eps = eps.to(device)
+            gam = gam.to(device)
+            Nf = Nf.to(device)
+            FPv = FPv.to(device)
+            mech_lbl = mech_lbl.to(device)
+
             feats = transformer_model(X_seq)
             Xc    = torch.cat([feats, eps, gam, FPv], dim=1)
             pred_life, pred_mech = pinn_model(Xc)
@@ -1090,27 +1122,27 @@ def train_with_leave_one_out(transformer_model, pinn_model, dataset, material_na
         train_indices = [i for i in range(n_samples) if i != test_idx]
         test_index = test_idx
 
-        train_strain = all_strain_series[train_indices]  # (N-1, seq_len, 2)
-        train_epsilon_a = all_epsilon_a[train_indices]   # (N-1,1)
-        train_gamma_a = all_gamma_a[train_indices]
-        train_Nf = all_Nf[train_indices]
-        train_FP = all_FP[train_indices]
+        train_strain = all_strain_series[train_indices].to(device)  # (N-1, seq_len, 2)
+        train_epsilon_a = all_epsilon_a[train_indices].to(device)   # (N-1,1)
+        train_gamma_a = all_gamma_a[train_indices].to(device)
+        train_Nf = all_Nf[train_indices].to(device)
+        train_FP = all_FP[train_indices].to(device)
 
-        test_strain = all_strain_series[test_index].unsqueeze(0)      # (1, seq_len, 2)
-        test_epsilon_a = all_epsilon_a[test_index].unsqueeze(0)      # (1,1)
-        test_gamma_a = all_gamma_a[test_index].unsqueeze(0)
-        test_Nf = all_Nf[test_index].unsqueeze(0)
-        test_FP = all_FP[test_index].unsqueeze(0)
+        test_strain = all_strain_series[test_index].unsqueeze(0).to(device)      # (1, seq_len, 2)
+        test_epsilon_a = all_epsilon_a[test_index].unsqueeze(0).to(device)      # (1,1)
+        test_gamma_a = all_gamma_a[test_index].unsqueeze(0).to(device)
+        test_Nf = all_Nf[test_index].unsqueeze(0).to(device)
+        test_FP = all_FP[test_index].unsqueeze(0).to(device)
 
         # 重新初始化模型（每折独立）
         transformer_input_size = 2
         d_model = 32
         nhead = 2
         num_layers = 1
-        transformer_model_fold = TransformerFeatureExtractor(transformer_input_size, d_model, nhead, num_layers, dropout=0.0)
+        transformer_model_fold = TransformerFeatureExtractor(transformer_input_size, d_model, nhead, num_layers, dropout=0.0).to(device)
         pinn_input_size = d_model + 3
         hidden_layers = [32, 16]
-        pinn_model_fold = MFLP_PINN(pinn_input_size, hidden_layers, dropout=0.0)
+        pinn_model_fold = MFLP_PINN(pinn_input_size, hidden_layers, dropout=0.0).to(device)
 
         optimizer = optim.AdamW(
             list(transformer_model_fold.parameters()) + list(pinn_model_fold.parameters()),
@@ -1297,15 +1329,22 @@ def train_with_leave_one_out(transformer_model, pinn_model, dataset, material_na
 
 def train_final_model(strain_series, epsilon_a, gamma_a, Nf, FP, material_name):
     """使用所有数据训练最终模型"""
+    # 移动数据到指定设备
+    strain_series = strain_series.to(device)
+    epsilon_a = epsilon_a.to(device)
+    gamma_a = gamma_a.to(device)
+    Nf = Nf.to(device)
+    FP = FP.to(device)
+
     # 初始化模型
     lstm_input_size = 2
     lstm_hidden_size = 32
     lstm_num_layers = 2
-    lstm_model = TransformerFeatureExtractor(lstm_input_size, d_model=lstm_hidden_size, nhead=2, num_layers=lstm_num_layers, dropout=0.2)
-    
+    lstm_model = TransformerFeatureExtractor(lstm_input_size, d_model=lstm_hidden_size, nhead=2, num_layers=lstm_num_layers, dropout=0.2).to(device)
+
     pinn_input_size = 4
     hidden_layers = [64, 128, 64, 32]
-    pinn_model = MFLP_PINN(pinn_input_size, hidden_layers, dropout=0.2)
+    pinn_model = MFLP_PINN(pinn_input_size, hidden_layers, dropout=0.2).to(device)
     
     # 优化器 - 在最终模型中使用较小的学习率
     optimizer = optim.AdamW(
@@ -1349,14 +1388,14 @@ def train_final_model(strain_series, epsilon_a, gamma_a, Nf, FP, material_name):
         for i in range(0, n_samples, batch_size):
             indices = permutation[i:i+batch_size]
             
-            X_seq_batch = strain_series[indices]
-            epsilon_a_batch = epsilon_a[indices]
-            gamma_a_batch = gamma_a[indices]
-            Nf_batch = Nf[indices]
-            FP_batch = FP[indices]
-            
+            X_seq_batch = strain_series[indices].to(device)
+            epsilon_a_batch = epsilon_a[indices].to(device)
+            gamma_a_batch = gamma_a[indices].to(device)
+            Nf_batch = Nf[indices].to(device)
+            FP_batch = FP[indices].to(device)
+
             optimizer.zero_grad()
-            
+
             FP_LSTM = lstm_model(X_seq_batch)
             X_combined = torch.cat([FP_LSTM, epsilon_a_batch, gamma_a_batch, FP_batch], dim=1)
             Np_pred, _ = pinn_model(X_combined)
@@ -1456,6 +1495,14 @@ def visualize_results(transformer_model, pinn_model, loss_history, dataset, mate
     with torch.no_grad():
         for batch in dataloader:
             X_seq, epsilon_a, gamma_a, Nf, FP, mech_label = batch
+            # 移动数据到指定设备
+            X_seq = X_seq.to(device)
+            epsilon_a = epsilon_a.to(device)
+            gamma_a = gamma_a.to(device)
+            Nf = Nf.to(device)
+            FP = FP.to(device)
+            mech_label = mech_label.to(device)
+
             transformer_features = transformer_model(X_seq)
             X_combined = torch.cat([transformer_features, epsilon_a, gamma_a, FP], dim=1)
             Np_pred, pred_mech = pinn_model(X_combined)
@@ -1532,7 +1579,7 @@ def visualize_results(transformer_model, pinn_model, loss_history, dataset, mate
     with torch.no_grad():
         transformer_model.eval()
         # 提取所有样本的特征
-        transformer_features = transformer_model(dataset.strain_series)
+        transformer_features = transformer_model(dataset.strain_series.to(device))
         # 计算特征的平均重要性
         feature_importance = transformer_features.mean(dim=0).cpu().numpy()
         # 绘制特征重要性
@@ -1654,81 +1701,81 @@ def visualize_file_results(results, material_name):
     print(f"误差标准差: {np.std(log_errors):.4f}")
     print(f"在1.5倍误差带内的预测: {in_factor_two}/{len(log_errors)} ({percent_in_factor_two:.2f}%)")
 
-def train_models_by_individual_file(material_name='AISI316L'):
-    # 获取所有数据文件
-    data_dir = get_strain_series_path(material_name)
-    output_dir = get_output_path(material_name, '')
-    model_dir = os.path.join(output_dir, 'models')
-    csv_dir = os.path.join(output_dir, 'csv')
-    os.makedirs(model_dir, exist_ok=True)
-    os.makedirs(csv_dir, exist_ok=True)
-    
-    data_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
-    if not data_files:
-        print(f"在 {data_dir} 中没有找到CSV文件")
-        return
-    
-    results = []
-    
-    for file_name in tqdm(data_files, desc=f"训练 {material_name} 的文件"):
-        try:
-            data_path = os.path.join(data_dir, file_name)
-            dataset = FatigueDataset(material_name=material_name)
-            
-            # 创建数据加载器
-            dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
-            
-            # 创建模型
-            lstm_model = FatigueLSTM(input_size=2, hidden_size=64, num_layers=2, dropout=0.2).to(device)
-            pinn_model = FatiguePINN(input_size=2, hidden_size=64, num_layers=2, dropout=0.2).to(device)
-            
-            # 训练模型
-            train_single_file_model(lstm_model, pinn_model, dataset.X_seq, dataset.epsilon_a, dataset.gamma_a, dataset.Nf, dataset.FP, device)
-            
-            # 预测
-            lstm_model.eval()
-            pinn_model.eval()
-            with torch.no_grad():
-                Np_pred = lstm_model(dataset.X_seq.unsqueeze(0)).squeeze()
-                Np_pinn = pinn_model(dataset.X_seq.unsqueeze(0)).squeeze()
-            
-            # 计算误差
-            mse = F.mse_loss(Np_pred, dataset.Nf)
-            rmse = torch.sqrt(mse)
-            mae = F.l1_loss(Np_pred, dataset.Nf)
-            
-            # 保存结果
-            result = {
-                'file_name': file_name,
-                'mse': mse.item(),
-                'rmse': rmse.item(),
-                'mae': mae.item(),
-                'material': material_name
-            }
-            results.append(result)
-            
-            # 保存模型
-            model_path = os.path.join(model_dir, f"{file_name.replace('.csv', '')}_model.pth")
-            torch.save({
-                'lstm_state_dict': lstm_model.state_dict(),
-                'pinn_state_dict': pinn_model.state_dict(),
-                'mse': mse.item(),
-                'rmse': rmse.item(),
-                'mae': mae.item()
-            }, model_path)
-            
-            # 每个文件训练完成后立即保存结果到CSV
-            df = pd.DataFrame(results)
-            csv_path = os.path.join(csv_dir, f"{material_name}_results.csv")
-            df.to_csv(csv_path, index=False)
-            print(f"已保存 {material_name} 的结果到 {csv_path}")
-            
-        except Exception as e:
-            print(f"处理文件 {file_name} 时出错: {str(e)}")
-            continue
-    
-    print(f"完成 {material_name} 的训练")
-    return results
+# def train_models_by_individual_file(material_name='AISI316L'):
+#     # 获取所有数据文件
+#     data_dir = get_strain_series_path(material_name)
+#     output_dir = get_output_path(material_name, '')
+#     model_dir = os.path.join(output_dir, 'models')
+#     csv_dir = os.path.join(output_dir, 'csv')
+#     os.makedirs(model_dir, exist_ok=True)
+#     os.makedirs(csv_dir, exist_ok=True)
+#
+#     data_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+#     if not data_files:
+#         print(f"在 {data_dir} 中没有找到CSV文件")
+#         return
+#
+#     results = []
+#
+#     for file_name in tqdm(data_files, desc=f"训练 {material_name} 的文件"):
+#         try:
+#             data_path = os.path.join(data_dir, file_name)
+#             dataset = FatigueDataset(material_name=material_name)
+#
+#             # 创建数据加载器
+#             dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+#
+#             # 创建模型
+#             lstm_model = FatigueLSTM(input_size=2, hidden_size=64, num_layers=2, dropout=0.2).to(device)
+#             pinn_model = FatiguePINN(input_size=2, hidden_size=64, num_layers=2, dropout=0.2).to(device)
+#
+#             # 训练模型
+#             train_single_file_model(lstm_model, pinn_model, dataset.X_seq, dataset.epsilon_a, dataset.gamma_a, dataset.Nf, dataset.FP, device)
+#
+#             # 预测
+#             lstm_model.eval()
+#             pinn_model.eval()
+#             with torch.no_grad():
+#                 Np_pred = lstm_model(dataset.X_seq.unsqueeze(0)).squeeze()
+#                 Np_pinn = pinn_model(dataset.X_seq.unsqueeze(0)).squeeze()
+#
+#             # 计算误差
+#             mse = F.mse_loss(Np_pred, dataset.Nf)
+#             rmse = torch.sqrt(mse)
+#             mae = F.l1_loss(Np_pred, dataset.Nf)
+#
+#             # 保存结果
+#             result = {
+#                 'file_name': file_name,
+#                 'mse': mse.item(),
+#                 'rmse': rmse.item(),
+#                 'mae': mae.item(),
+#                 'material': material_name
+#             }
+#             results.append(result)
+#
+#             # 保存模型
+#             model_path = os.path.join(model_dir, f"{file_name.replace('.csv', '')}_model.pth")
+#             torch.save({
+#                 'lstm_state_dict': lstm_model.state_dict(),
+#                 'pinn_state_dict': pinn_model.state_dict(),
+#                 'mse': mse.item(),
+#                 'rmse': rmse.item(),
+#                 'mae': mae.item()
+#             }, model_path)
+#
+#             # 每个文件训练完成后立即保存结果到CSV
+#             df = pd.DataFrame(results)
+#             csv_path = os.path.join(csv_dir, f"{material_name}_results.csv")
+#             df.to_csv(csv_path, index=False)
+#             print(f"已保存 {material_name} 的结果到 {csv_path}")
+#
+#         except Exception as e:
+#             print(f"处理文件 {file_name} 时出错: {str(e)}")
+#             continue
+#
+#     print(f"完成 {material_name} 的训练")
+#     return results
 
 def train_all_files_together(material_name, model_params=None, training_params=None):
     print(f"\n开始使用所有文件数据一起训练{material_name}材料的模型...")
@@ -1857,13 +1904,13 @@ def train_all_files_together(material_name, model_params=None, training_params=N
         nhead=model_params['transformer']['nhead'],
         num_layers=model_params['transformer']['num_layers'],
         dropout=model_params['transformer']['dropout']
-    )
-                
+    ).to(device)
+
     pinn_model = MFLP_PINN(
         input_size=model_params['pinn']['input_size'],
         hidden_layers=model_params['pinn']['hidden_layers'],
         dropout=model_params['pinn']['dropout']
-    )
+    ).to(device)
     # 创建数据加载器
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -1918,7 +1965,14 @@ def train_all_files_together(material_name, model_params=None, training_params=N
         
         for batch_idx, batch in enumerate(dataloader):
             X_seq, epsilon_a_batch, gamma_a_batch, Nf_batch, FP_batch = batch
-            
+
+            # 移动数据到指定设备
+            X_seq = X_seq.to(device)
+            epsilon_a_batch = epsilon_a_batch.to(device)
+            gamma_a_batch = gamma_a_batch.to(device)
+            Nf_batch = Nf_batch.to(device)
+            FP_batch = FP_batch.to(device)
+
             # 前向传播
             transformer_features = transformer_model(X_seq)
             X_combined = torch.cat([transformer_features, epsilon_a_batch, gamma_a_batch, FP_batch], dim=1)
@@ -2021,7 +2075,7 @@ def train_all_files_together(material_name, model_params=None, training_params=N
                 X_combined = torch.cat([all_features, epsilon_a, gamma_a, FP], dim=1)
                 all_predictions = pinn_model(X_combined)
                 
-                plt.scatter(Nf.numpy(), all_predictions.numpy(), c='b', label='Predictions')
+                plt.scatter(Nf.cpu().numpy(), all_predictions.cpu().numpy(), c='b', label='Predictions')
                 min_val = min(Nf.min().item(), all_predictions.min().item())
                 max_val = max(Nf.max().item(), all_predictions.max().item())
                 plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Prediction')
@@ -2052,7 +2106,7 @@ def train_all_files_together(material_name, model_params=None, training_params=N
             plt.subplot(2, 2, 4)
             with torch.no_grad():
                 log_errors = torch.abs(torch.log10(all_predictions) - torch.log10(Nf))
-                plt.hist(log_errors.numpy(), bins=20, color='b', alpha=0.7)
+                plt.hist(log_errors.cpu().numpy(), bins=20, color='b', alpha=0.7)
                 plt.axvline(x=np.log10(2), color='r', linestyle='--', label='Factor of 2')
                 plt.xlabel('Log Error')
                 plt.ylabel('Count')
