@@ -12,6 +12,7 @@ import matplotlib
 # 把 'TkAgg' → 'Agg'，在无 GUI 的服务器/容器也能正常保存图像
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 import pandas as pd
 import numpy as np
 import json
@@ -2148,12 +2149,20 @@ def train_all_files_together(material_name, model_params=None, training_params=N
 # 主程序
 # ----------------------------
 if __name__ == "__main__":
-    # 设置中文字体支持
-    try:
-        plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
-        plt.rcParams['axes.unicode_minus'] = False    # 用来正常显示负号
-    except:
-        print("警告: 无法设置中文字体，图表中文可能无法正确显示")
+    # 设置中文字体支持（自动检测已安装字体，无需异常处理）
+    available_fonts = {f.name for f in fm.fontManager.ttflist}
+    candidate_fonts = [
+        'SimHei',
+        'Noto Sans CJK SC', 'Noto Sans CJK', 'Noto Sans SC',
+        'Source Han Sans SC',
+        'Microsoft YaHei', 'PingFang SC', 'Heiti SC', 'WenQuanYi Micro Hei',
+        'DejaVu Sans'
+    ]
+    chosen_font = next((n for n in candidate_fonts if n in available_fonts), 'DejaVu Sans')
+    if chosen_font == 'DejaVu Sans':
+        print("警告: 未找到常见中文字体，将使用默认字体；中文可能显示为方块。建议安装 Noto Sans CJK。")
+    plt.rcParams['font.sans-serif'] = [chosen_font]
+    plt.rcParams['axes.unicode_minus'] = False
     
     # 处理所有材料
     # materials = ['Q235B2']
