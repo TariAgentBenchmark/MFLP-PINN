@@ -646,9 +646,18 @@ class FatigueDataset(torch.utils.data.Dataset):
                     return 1.0 if R < 1.4 else (0.6 if R < 1.6 else 0.0)
                 if mat == 'GH4169':
                     return 1.0 if R < 1.35 else (0.5 if R < 1.55 else 0.0)
+                if mat == 'CuZn37':
+                    if R < 1.0:
+                        return 0.0
+                    elif R < 1.55:
+                        return 0.5
+                    elif R <= 1.6:
+                        return 0.6
+                    else:
+                        return 1.0
                 return -1.0
 
-            if material_name in ('TC4', 'GH4169'):
+            if material_name in ('TC4', 'GH4169', 'CuZn37'):
                 labels = [gen_label(material_name, d['gamma_a'], d['epsilon_a']) for d in self.matched_data]
                 self.mech_label = torch.tensor(labels, dtype=torch.float32).unsqueeze(1)
             else:
