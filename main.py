@@ -90,32 +90,32 @@ materials_params = {
 
 DATA_DIRS = {
                'AISI316L': {
-        'strain_series': 'C:/Users/HP/Desktop/AISI316L应变时间序列数据',
-        'fatigue_data': 'C:/Users/HP/Desktop/多轴疲劳试验数据/AISI316L多轴疲劳试验数据.xls'
+        'strain_series': 'data/AISI316L应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/AISI316L多轴疲劳试验数据.xls'
                 },
                 'GH4169': {
-        'strain_series': 'C:/Users/HP/Desktop/GH4169应变时间序列数据',
-        'fatigue_data': 'C:/Users/HP/Desktop/多轴疲劳试验数据/GH4169多轴疲劳试验数据.xls'
+        'strain_series': 'data/GH4169应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/GH4169多轴疲劳试验数据.xls'
                 },
                 'TC4': {
-        'strain_series': 'C:/Users/HP/Desktop/TC4应变时间序列数据',
-        'fatigue_data': 'C:/Users/HP/Desktop/多轴疲劳试验数据/TC4多轴疲劳试验数据.xls'
+        'strain_series': 'data/TC4应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/TC4多轴疲劳试验数据.xls'
     },
 
     'CuZn37': {
-        'strain_series': 'C:/Users/HP/Desktop/CuZn37应变时间序列数据',
-        'fatigue_data': 'C:/Users/HP/Desktop/多轴疲劳试验数据/CuZn37黄铜多轴疲劳试验数据.xls'
+        'strain_series': 'data/CuZn37应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/CuZn37黄铜多轴疲劳试验数据.xls'
     },
 
     'Q235B1': {
-        'strain_series': 'C:/Users/HP/Desktop/Q235B基础金属应变时间序列数据',
-        'fatigue_data': 'C:/Users/HP/Desktop/多轴疲劳试验数据/Q235B1.xls'
+        'strain_series': 'data/Q235B基础金属应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/Q235B1.xls'
     },
     'Q235B2': {
-        'strain_series': 'C:/Users/HP/Desktop/Q235B焊接金属应变时间序列数据',
-        'fatigue_data': 'C:/Users/HP/Desktop/多轴疲劳试验数据/Q235B2.xls'
+        'strain_series': 'data/Q235B焊接金属应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/Q235B2.xls'
     }
-    
+
 }
 
 
@@ -757,7 +757,7 @@ def train_model(material_name):
         lr=0.001, weight_decay=1e-4
     )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=50, verbose=True, min_lr=1e-6
+        optimizer, mode='min', factor=0.5, patience=50, min_lr=1e-6
     )
 
     # 训练超参
@@ -1884,8 +1884,7 @@ def train_all_files_together(material_name, model_params=None, training_params=N
         mode='min',
         factor=training_params['scheduler_factor'],
         patience=training_params['scheduler_patience'],
-        min_lr=training_params['min_lr'],
-        verbose=True
+        min_lr=training_params['min_lr']
     )
     
     # 训练循环
