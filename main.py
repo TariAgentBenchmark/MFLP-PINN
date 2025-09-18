@@ -973,7 +973,7 @@ def train_model(material_name):
                         c='b', label='Predictions')
 
             plt.plot([mn, mx], [mn, mx], 'r--', label='Perfect')
-            plt.plot([mn, mx], [mn / 2, mx / 2], 'k:', label='×1.5')
+            plt.plot([mn, mx], [mn / 2, mx / 2], 'k:', label='Factor of 2')
             plt.plot([mn, mx], [mn * 2, mx * 2], 'k:')
             plt.xscale('log');
             plt.yscale('log')
@@ -1001,7 +1001,7 @@ def train_model(material_name):
 
             # 只传入一维数组，去掉多余的 color 参数
             plt.hist(errs_np, bins=20, alpha=0.7)
-            plt.axvline(x=np.log10(2), color='r', linestyle='--', label='×1.5')
+            plt.axvline(x=np.log10(2), color='r', linestyle='--', label='Factor of 2')
             plt.xlabel('Log Error')
             plt.ylabel('Count')
             plt.legend()
@@ -1017,7 +1017,7 @@ def train_model(material_name):
     print(f'训练完成。加载最佳模型 (Epoch {best_epoch+1}, Val Loss={best_loss:.4f})')
 
     # ========== 测试集评估 ==========
-    print("\n在测试集上评估最终模型...")
+    print("\nEvaluating on test set...")
     transformer_model.eval(); pinn_model.eval()
     test_loss = test_data_loss = test_physical_loss = 0.0
     all_predictions, all_true_values = [], []
@@ -1057,7 +1057,7 @@ def train_model(material_name):
     avg_test_loss      = test_loss / len(test_loader)
     avg_test_data_loss = test_data_loss / len(test_loader)
     avg_test_phys_loss = test_physical_loss / len(test_loader)
-    print(f"\n测试集结果: Test Loss={avg_test_loss:.4f}, Data Loss={avg_test_data_loss:.4f}, Physical Loss={avg_test_phys_loss:.4f}")
+    print(f"\nTest results: Test Loss={avg_test_loss:.4f}, Data Loss={avg_test_data_loss:.4f}, Physical Loss={avg_test_phys_loss:.4f}")
 
     # 保存预测结果 CSV
     results_path = get_output_path(material_name, f"{material_name}_test_predictions.csv")
@@ -1068,7 +1068,7 @@ def train_model(material_name):
         'Predicted_Mechanism_Prob': np.array(all_pred_mech).flatten()
     })
     results_df.to_csv(results_path, index=False)
-    print(f"预测结果已保存到: {results_path}")
+    print(f"Predictions saved to: {results_path}")
 
     # 计算 AUC 和 准确率
     valid_mask = np.array(all_true_mech).flatten() >= 0
@@ -1077,26 +1077,54 @@ def train_model(material_name):
         prob     = np.array(all_pred_mech)[valid_mask]
         auc = roc_auc_score(true_bin, prob)
         acc = accuracy_score(true_bin, (prob >= 0.5).astype(int))
-        print(f"机制预测 AUC: {auc:.4f}, 准确率: {acc:.4f}")
+        print(f"Mechanism AUC: {auc:.4f}, Accuracy: {acc:.4f}")
 
     # 绘制并保存测试散点图
     true_vals = np.array(all_true_values).flatten()
     preds_np = np.array(all_predictions).flatten()
     plt.figure(figsize=(10, 8))
-    plt.scatter(true_vals, preds_np, alpha=0.6, label='预测值')
+    plt.scatter(true_vals, preds_np, alpha=0.6, label='Predicted')
     mn = float(min(true_vals.min(), preds_np.min()))
     mx = float(max(true_vals.max(), preds_np.max()))
-    plt.plot([mn, mx], [mn, mx], 'r--', label='完美预测')
-    plt.plot([mn, mx], [mn/2, mx/2], 'k:', label='×1.5')
+    plt.plot([mn, mx], [mn, mx], 'r--', label='Perfect')
+    plt.plot([mn, mx], [mn/2, mx/2], 'k:', label='Factor of 2')
     plt.plot([mn, mx], [mn*2, mx*2], 'k:')
     plt.xscale('log'); plt.yscale('log')
-    plt.xlabel('真实疲劳寿命 (Nf)'); plt.ylabel('预测疲劳寿命 (Np)')
-    plt.title(f'{material_name} 测试集预测结果')
+    plt.xlabel('True Life (Nf)'); plt.ylabel('Predicted Life (Np)')
+    plt.title(f'{material_name} Test Predictions')
     plt.legend(); plt.grid(True)
     plot_path = get_output_path(material_name, f"{material_name}_test_prediction_plot.png")
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"测试集预测图已保存到: {plot_path}")
+    print(f"Test scatter saved to: {plot_path}")
+
+    # 绘制并保存训练散点图
+    transformer_model.eval(); pinn_model.eval()
+    with torch.no_grad():
+        feats_tr = transformer_model(train_dataset.strain_series.to(device))
+        Xc_tr = torch.cat([feats_tr,
+                           train_dataset.epsilon_a.to(device),
+                           train_dataset.gamma_a.to(device),
+                           train_dataset.FP.to(device)], dim=1)
+        preds_tr, _ = pinn_model(Xc_tr)
+
+    true_tr = train_dataset.Nf.detach().cpu().numpy().flatten()
+    preds_tr_np = preds_tr.detach().cpu().numpy().flatten()
+    plt.figure(figsize=(10, 8))
+    plt.scatter(true_tr, preds_tr_np, alpha=0.6, label='Train Predictions')
+    mn_tr = float(min(true_tr.min(), preds_tr_np.min()))
+    mx_tr = float(max(true_tr.max(), preds_tr_np.max()))
+    plt.plot([mn_tr, mx_tr], [mn_tr, mx_tr], 'r--', label='Perfect')
+    plt.plot([mn_tr, mx_tr], [mn_tr / 2, mx_tr / 2], 'k:', label='Factor of 2')
+    plt.plot([mn_tr, mx_tr], [mn_tr * 2, mx_tr * 2], 'k:')
+    plt.xscale('log'); plt.yscale('log')
+    plt.xlabel('True Life (Nf)'); plt.ylabel('Predicted Life (Np)')
+    plt.title(f'{material_name} Train Predictions')
+    plt.legend(); plt.grid(True)
+    train_plot_path = get_output_path(material_name, f"{material_name}_train_prediction_plot.png")
+    plt.savefig(train_plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Train scatter saved to: {train_plot_path}")
 
     return transformer_model, pinn_model, loss_history, test_dataset
 
@@ -1250,19 +1278,19 @@ def train_with_leave_one_out(transformer_model, pinn_model, dataset, material_na
                     upper = x_vals * (10 ** err)
 
                     plt.figure(figsize=(6, 5))
-                    plt.scatter([true_val], [pred_val], color='red', label='预测值')
-                    plt.plot(x_vals, x_vals, 'k--', label='完美预测')
-                    plt.fill_between(x_vals, lower, upper, alpha=0.2, label='误差带')
-                    plt.xlabel('实际疲劳寿命')
-                    plt.ylabel('预测疲劳寿命')
-                    plt.title(f'{material_name} - 折 {test_idx+1} 第{epoch+1}轮预测')
+                    plt.scatter([true_val], [pred_val], color='red', label='Predicted')
+                    plt.plot(x_vals, x_vals, 'k--', label='Perfect')
+                    plt.fill_between(x_vals, lower, upper, alpha=0.2, label='Error band')
+                    plt.xlabel('True Life')
+                    plt.ylabel('Predicted Life')
+                    plt.title(f'{material_name} - Fold {test_idx+1} Epoch {epoch+1} Prediction')
                     plt.legend()
                     plt.grid(True)
                     plot_path = get_output_path(material_name, f"loo_fold{test_idx+1}_epoch_{epoch+1}.png")
                     plt.savefig(plot_path)
                     plt.close()
                 except Exception as e:
-                    print(f"可视化当前折 (样本 {test_idx+1}) 时出错: {e}")
+                    print(f"Error visualizing fold (sample {test_idx+1}): {e}")
 
         # 评估当前折最终结果并保存
         with torch.no_grad():
@@ -1314,8 +1342,8 @@ def train_with_leave_one_out(transformer_model, pinn_model, dataset, material_na
 
     # 绘制最终折的总体预测（所有样本）
     plt.figure(figsize=(10, 6))
-    plt.scatter(all_true_lifes, all_true_lifes, color='blue', label='实际值')
-    plt.scatter(all_true_lifes, all_pred_lifes, color='red', label='预测值')
+    plt.scatter(all_true_lifes, all_true_lifes, color='blue', label='True')
+    plt.scatter(all_true_lifes, all_pred_lifes, color='red', label='Predicted')
 
     # 误差带（每个样本分别）
     error = np.abs(np.log10(np.array(all_pred_lifes)) - np.log10(np.array(all_true_lifes)))
@@ -1325,12 +1353,12 @@ def train_with_leave_one_out(transformer_model, pinn_model, dataset, material_na
         np.array(all_true_lifes),
         lower,
         upper,
-        alpha=0.2, color='gray', label='误差带'
+        alpha=0.2, color='gray', label='Error band'
     )
 
-    plt.xlabel('实际疲劳寿命')
-    plt.ylabel('预测疲劳寿命')
-    plt.title(f'{material_name} - 最终预测结果')
+    plt.xlabel('True Life')
+    plt.ylabel('Predicted Life')
+    plt.title(f'{material_name} - Final Predictions')
     plt.legend()
     plt.grid(True)
 
@@ -1502,7 +1530,7 @@ def visualize_results(transformer_model, pinn_model, loss_history, dataset, mate
     # 保存图表到输出目录
     loss_plot_path = get_output_path(material_name, f"{material_name}_loss_history.png")
     plt.savefig(loss_plot_path)
-    print(f"{material_name} 损失曲线已保存到: {loss_plot_path}")
+    print(f"{material_name} loss curve saved to: {loss_plot_path}")
     # plt.show()  # 注释掉
 
     # 预测结果评估
@@ -1551,11 +1579,11 @@ def visualize_results(transformer_model, pinn_model, loss_history, dataset, mate
 
     # 3. 构造 DataFrame
     df_results = pd.DataFrame({
-        "正应变幅值": eps_np,
-        "剪应变幅值": gam_np,
-        "实际疲劳寿命(Nf)": nf_np,
-        "预测疲劳寿命(Np)": pred_np,
-        "对数误差": log_err_np
+        "epsilon_a": eps_np,
+        "gamma_a": gam_np,
+        "Nf_true": nf_np,
+        "Np_pred": pred_np,
+        "log_error": log_err_np
     })
     # —— 替换结束 ——
 
@@ -1569,14 +1597,14 @@ def visualize_results(transformer_model, pinn_model, loss_history, dataset, mate
     min_val = min(np.min(Nf), np.min(Np_pred)) * 0.8
     max_val = max(np.max(Nf), np.max(Np_pred)) * 1.2
     
-    plt.plot([min_val, max_val], [min_val, max_val], 'r-', linewidth=2, label="完美预测")
+    plt.plot([min_val, max_val], [min_val, max_val], 'r-', linewidth=2, label="Perfect prediction")
 
-    plt.plot([min_val, max_val], [min_val/2, max_val/2], 'k--', linewidth=1, label="1.5倍误差带")
+    plt.plot([min_val, max_val], [min_val/2, max_val/2], 'k--', linewidth=1, label="Factor of 2")
     plt.plot([min_val, max_val], [min_val*2, max_val*2], 'k--', linewidth=1)
     
-    plt.xlabel("实际疲劳寿命 (Nf)", fontsize=12)
-    plt.ylabel("预测疲劳寿命 (Np)", fontsize=12)
-    plt.title(f"{material_name} 疲劳寿命预测结果", fontsize=14)
+    plt.xlabel("True Life (Nf)", fontsize=12)
+    plt.ylabel("Predicted Life (Np)", fontsize=12)
+    plt.title(f"{material_name} Fatigue Life Predictions", fontsize=14)
     plt.xscale('log')
     plt.yscale('log')
     plt.grid(True, which='both', linestyle='--', alpha=0.5)
@@ -1586,7 +1614,7 @@ def visualize_results(transformer_model, pinn_model, loss_history, dataset, mate
     # 保存图表到输出目录
     pred_plot_path = get_output_path(material_name, f"{material_name}_prediction_results.png")
     plt.savefig(pred_plot_path, dpi=300)
-    print(f"{material_name} 预测结果散点图已保存到: {pred_plot_path}")
+    print(f"{material_name} prediction scatter saved to: {pred_plot_path}")
     # plt.show()  # 注释掉
     
     # 可视化Transformer特征重要性
@@ -1599,15 +1627,15 @@ def visualize_results(transformer_model, pinn_model, loss_history, dataset, mate
         feature_importance = transformer_features.mean(dim=0).cpu().numpy()
         # 绘制特征重要性
         plt.bar(range(len(feature_importance)), feature_importance, alpha=0.7)
-        plt.xlabel('特征索引', fontsize=12)
-        plt.ylabel('特征重要性', fontsize=12)
-        plt.title(f'{material_name} Transformer特征重要性分析', fontsize=14)
+        plt.xlabel('Feature Index', fontsize=12)
+        plt.ylabel('Feature Importance', fontsize=12)
+        plt.title(f'{material_name} Transformer Feature Importance', fontsize=14)
         plt.grid(True, axis='y', alpha=0.3)
     
     # 保存特征重要性图表
     feature_plot_path = get_output_path(material_name, f"{material_name}_feature_importance.png")
     plt.savefig(feature_plot_path, dpi=300)
-    print(f"{material_name} 特征重要性图已保存到: {feature_plot_path}")
+    print(f"{material_name} feature importance saved to: {feature_plot_path}")
     # plt.show()  # 注释掉
 
 def visualize_file_results(results, material_name):
@@ -1638,7 +1666,7 @@ def visualize_file_results(results, material_name):
         plt.scatter(
             [true_life[j] for j in sheet_indices],
             [pred_life[j] for j in sheet_indices],
-            label=f"表格 {sheet}",
+            label=f"Sheet {sheet}",
             color=sheet_colors[i],
             alpha=0.7,
             s=60
@@ -1648,13 +1676,13 @@ def visualize_file_results(results, material_name):
     min_val = min(min(true_life), min(pred_life)) * 0.8
     max_val = max(max(true_life), max(pred_life)) * 1.2
     
-    plt.plot([min_val, max_val], [min_val, max_val], 'r-', linewidth=2, label="完美预测")
-    plt.plot([min_val, max_val], [min_val/2, max_val/2], 'k--', linewidth=1, label="1.5倍误差带")
+    plt.plot([min_val, max_val], [min_val, max_val], 'r-', linewidth=2, label="Perfect prediction")
+    plt.plot([min_val, max_val], [min_val/2, max_val/2], 'k--', linewidth=1, label="Factor of 2")
     plt.plot([min_val, max_val], [min_val*2, max_val*2], 'k--', linewidth=1)
     
-    plt.xlabel("实际疲劳寿命 (Nf)", fontsize=12)
-    plt.ylabel("预测疲劳寿命 (Np)", fontsize=12)
-    plt.title(f"{material_name} 所有文件的疲劳寿命预测结果", fontsize=14)
+    plt.xlabel("True Life (Nf)", fontsize=12)
+    plt.ylabel("Predicted Life (Np)", fontsize=12)
+    plt.title(f"{material_name} Predictions for All Files", fontsize=14)
     plt.xscale('log')
     plt.yscale('log')
     plt.grid(True, which='both', linestyle='--', alpha=0.5)
@@ -1676,11 +1704,11 @@ def visualize_file_results(results, material_name):
     bar_colors = [sheet_colors[unique_sheets.index(sheet)] for sheet in sorted_sheets]
     
     plt.bar(range(len(sorted_files)), sorted_errors, color=bar_colors)
-    plt.axhline(y=np.log10(2), color='r', linestyle='--', label="1.5倍误差带界限")
+    plt.axhline(y=np.log10(2), color='r', linestyle='--', label="Factor of 2 threshold")
     
-    plt.xlabel("文件索引", fontsize=12)
-    plt.ylabel("对数误差", fontsize=12)
-    plt.title(f"{material_name} 所有文件的预测误差排序", fontsize=14)
+    plt.xlabel("File Index", fontsize=12)
+    plt.ylabel("Log Error", fontsize=12)
+    plt.title(f"{material_name} Sorted Prediction Errors", fontsize=14)
     plt.grid(True, axis='y', linestyle='--', alpha=0.7)
     plt.legend()
     plt.tight_layout()
@@ -1692,11 +1720,11 @@ def visualize_file_results(results, material_name):
     # 3. 误差与应变关系图
     plt.figure(figsize=(10, 8))
     plt.scatter(epsilon_a, gamma_a, c=log_errors, cmap='viridis', s=100, alpha=0.7)
-    plt.colorbar(label="对数误差")
+    plt.colorbar(label="Log Error")
     
-    plt.xlabel("正应变幅值 (ε_a)", fontsize=12)
-    plt.ylabel("剪应变幅值 (γ_a)", fontsize=12)
-    plt.title(f"{material_name} 预测误差与应变关系", fontsize=14)
+    plt.xlabel("Normal Strain Amplitude (ε_a)", fontsize=12)
+    plt.ylabel("Shear Strain Amplitude (γ_a)", fontsize=12)
+    plt.title(f"{material_name} Error vs Strain", fontsize=14)
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.tight_layout()
     
