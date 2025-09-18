@@ -33,6 +33,89 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
+# 材料参数（沿用 main.py 的定义）
+materials_params = {
+    'AISI316L': {
+        'G': 67.3,
+        'tau_f_G': 430.4,
+        'gamma_f': 0.279,
+        'b0': -0.092,
+        'c0': -0.419,
+    },
+    'GH4169': {
+        'G': 67.0,
+        'tau_f_G': 1091.6,
+        'gamma_f': 4.46,
+        'b0': -0.07,
+        'c0': -0.77,
+    },
+    'TC4': {
+        'G': 43.2,
+        'tau_f_G': 716.9,
+        'gamma_f': 2.24,
+        'b0': -0.06,
+        'c0': -0.8,
+    },
+    'CuZn37': {
+        'G': 49.6,
+        'tau_f_G': 356.1,
+        'gamma_f': 0.068,
+        'b0': -0.0816,
+        'c0': -0.3298,
+    },
+    'Q235B1': {
+        'G': 81.4,
+        'tau_f_G': 308.9,
+        'gamma_f': 0.9751,
+        'b0': -0.0702,
+        'c0': -0.6723,
+    },
+    'Q235B2': {
+        'G': 76.3,
+        'tau_f_G': 299.9,
+        'gamma_f': 0.035,
+        'b0': -0.3555,
+        'c0': -0.3181,
+    },
+}
+
+
+def fs_loss(Np_pred: torch.Tensor, FP_true: torch.Tensor, material_name: str, eps: float = 1e-6) -> torch.Tensor:
+    """
+    FS 准则物理损失（与 main.py 一致的形式）：
+    - 使用材料参数 (G, tau_f_G, gamma_f, b0, c0)
+    - 预测 FP_pred = (tau_f'/G)*(2*Np)^b0 + gamma_f'*(2*Np)^c0
+    - 在 log10 空间以相对误差的 Huber 形式进行度量
+    """
+    params = materials_params[material_name]
+    tau_f_prime = torch.tensor(params['tau_f_G'], device=Np_pred.device, dtype=Np_pred.dtype)
+    gamma_f_prime = torch.tensor(params['gamma_f'], device=Np_pred.device, dtype=Np_pred.dtype)
+    b0 = torch.tensor(params['b0'], device=Np_pred.device, dtype=Np_pred.dtype)
+    c0 = torch.tensor(params['c0'], device=Np_pred.device, dtype=Np_pred.dtype)
+    G = torch.tensor(params['G'], device=Np_pred.device, dtype=Np_pred.dtype)
+
+    # 避免 0 或负数，且避免过高值造成数值不稳
+    Np_safe = torch.clamp(Np_pred, min=eps, max=1e5)
+
+    # 预测 FP
+    term1 = (tau_f_prime / G) * torch.pow(2.0 * Np_safe, b0)
+    term2 = gamma_f_prime * torch.pow(2.0 * Np_safe, c0)
+    FP_pred = term1 + term2
+
+    # clamp 真值，避免 log10 NaN
+    FP_pos = torch.clamp(FP_true, min=eps)
+
+    log_FP_pred = torch.log10(FP_pred + eps)
+    log_FP = torch.log10(FP_pos + eps)
+
+    # 相对误差的 Huber
+    relative_error = torch.abs(log_FP_pred - log_FP) / (torch.abs(log_FP) + eps)
+    delta = 0.1
+    huber_mask = relative_error < delta
+    loss = torch.where(huber_mask, 0.5 * relative_error ** 2, delta * relative_error - 0.5 * delta ** 2)
+    return loss.mean()
+
+
 def build_mlp(input_dim: int, hidden_dims: list[int], dropout: float) -> nn.Sequential:
     layers: list[nn.Module] = []
     prev_dim = input_dim
@@ -59,6 +142,9 @@ def train_mflp_pinn(
     upper_cycle_limit: float,
     lambda_nonneg: float,
     lambda_upper: float,
+    lambda_fs: float,
+    fp_train: np.ndarray,
+    material_name: str,
     device: torch.device,
     grad_clip_norm: float | None = None,
 ):
@@ -67,6 +153,7 @@ def train_mflp_pinn(
 
     X_tr = torch.from_numpy(X_train.astype(np.float32)).to(device)
     y_tr_log = torch.from_numpy(y_train_log10.astype(np.float32)).to(device)
+    FP_tr = torch.from_numpy(fp_train.astype(np.float32)).to(device)
 
     num_samples = X_tr.shape[0]
     num_batches = max(1, int(math.ceil(num_samples / max(1, batch_size))))
@@ -91,7 +178,11 @@ def train_mflp_pinn(
             loss_phys_low = F.relu(-Np_pred).mean() * float(lambda_nonneg)
             loss_phys_high = F.relu(Np_pred - float(upper_cycle_limit)).mean() * float(lambda_upper)
 
-            loss = loss_mse + loss_phys_low + loss_phys_high
+            # FS 物理损失（与 main.py 一致）
+            FP_b = FP_tr.index_select(0, idx)
+            loss_fs = fs_loss(Np_pred, FP_b, material_name) * float(lambda_fs)
+
+            loss = loss_mse + loss_phys_low + loss_phys_high + loss_fs
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -261,6 +352,7 @@ def run_material_split(
     upper_cycle_limit: float,
     lambda_nonneg: float,
     lambda_upper: float,
+    lambda_fs: float,
     test_ratio: float,
     seed: int,
     device: torch.device,
@@ -280,6 +372,9 @@ def run_material_split(
     n = Xz.shape[0]
     train_idx, test_idx = train_test_split_indices(n, test_ratio=float(test_ratio), seed=int(seed))
 
+    # 取 FP 真值
+    fp_all = np.array([m['FP'] for m in dataset['meta']], dtype=np.float64)
+
     # 训练
     model = train_mflp_pinn(
         X_train=Xz[train_idx],
@@ -293,6 +388,9 @@ def run_material_split(
         upper_cycle_limit=upper_cycle_limit,
         lambda_nonneg=lambda_nonneg,
         lambda_upper=lambda_upper,
+        lambda_fs=lambda_fs,
+        fp_train=fp_all[train_idx],
+        material_name=material,
         device=device,
         grad_clip_norm=1.0,
     )
@@ -317,6 +415,7 @@ def run_material_loo(
     upper_cycle_limit: float,
     lambda_nonneg: float,
     lambda_upper: float,
+    lambda_fs: float,
     seed: int,
     device: torch.device,
 ):
@@ -331,6 +430,7 @@ def run_material_loo(
     Xz = (X - mu) / sigma_safe
 
     n = Xz.shape[0]
+    fp_all = np.array([m['FP'] for m in dataset['meta']], dtype=np.float64)
     Np_pred_all = np.zeros(n, dtype=np.float64)
 
     rng = np.random.RandomState(int(seed))
@@ -353,6 +453,9 @@ def run_material_loo(
             upper_cycle_limit=upper_cycle_limit,
             lambda_nonneg=lambda_nonneg,
             lambda_upper=lambda_upper,
+            lambda_fs=lambda_fs,
+            fp_train=fp_all[mask],
+            material_name=material,
             device=device,
             grad_clip_norm=1.0,
         )
@@ -389,6 +492,7 @@ def main():
     parser.add_argument('--upper-cycles', type=float, default=1e7, help='疲劳寿命上限（物理约束）')
     parser.add_argument('--lambda-nonneg', type=float, default=1.0, help='非负约束权重')
     parser.add_argument('--lambda-upper', type=float, default=0.1, help='上界约束权重')
+    parser.add_argument('--lambda-fs', type=float, default=0.1, help='FS 物理损失权重')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
 
     args = parser.parse_args()
@@ -420,6 +524,7 @@ def main():
                         upper_cycle_limit=float(args.upper_cycles),
                         lambda_nonneg=float(args.lambda_nonneg),
                         lambda_upper=float(args.lambda_upper),
+                        lambda_fs=float(args.lambda_fs),
                         seed=int(args.seed),
                         device=dev,
                     )
@@ -436,6 +541,7 @@ def main():
                         upper_cycle_limit=float(args.upper_cycles),
                         lambda_nonneg=float(args.lambda_nonneg),
                         lambda_upper=float(args.lambda_upper),
+                        lambda_fs=float(args.lambda_fs),
                         test_ratio=float(args.test_ratio),
                         seed=int(args.seed),
                         device=dev,
@@ -456,6 +562,7 @@ def main():
                 upper_cycle_limit=float(args.upper_cycles),
                 lambda_nonneg=float(args.lambda_nonneg),
                 lambda_upper=float(args.lambda_upper),
+                lambda_fs=float(args.lambda_fs),
                 seed=int(args.seed),
                 device=dev,
             )
@@ -472,6 +579,7 @@ def main():
                 upper_cycle_limit=float(args.upper_cycles),
                 lambda_nonneg=float(args.lambda_nonneg),
                 lambda_upper=float(args.lambda_upper),
+                lambda_fs=float(args.lambda_fs),
                 test_ratio=float(args.test_ratio),
                 seed=int(args.seed),
                 device=dev,
