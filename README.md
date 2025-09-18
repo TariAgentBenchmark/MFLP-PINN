@@ -18,9 +18,32 @@ pip install -i https://mirrors.aliyun.com/pypi/simple/ -r req.txt
 
 ## 运行程序
 
-- 启动训练：
+### Bayesian 时间序列（不确定性估计）
+
+- ALL 材料，随机划分 train/test：
 ```bash
-uv run python main.py
+uv run python /home/hanbing/data/parttime/MFLP-PINN/bayesian_timeseries.py --material ALL --method split --test-ratio 0.2 --seed 42
 ```
 
-- 结果将保存到 `results/<材料名>/`。
+- 单一材料，留一验证（LOO）：
+```bash
+uv run python /home/hanbing/data/parttime/MFLP-PINN/bayesian_timeseries.py --material AISI316L --method loo --ci 0.95
+```
+
+- 输出位置：`results/<材料名>/<材料名>_bayes_timeseries_*`（csv/png）
+
+### MFLP-PINN（物理约束 PINN）
+
+- ALL 材料，train/test：
+```bash
+uv run python /home/hanbing/data/parttime/MFLP-PINN/mflp-pinn.py --material ALL --method split --hidden-dims 128,64 --epochs 1500 --upper-cycles 1e7
+```
+
+- 单一材料，LOO（脚本内默认缩短轮数以加速）：
+```bash
+uv run python /home/hanbing/data/parttime/MFLP-PINN/mflp-pinn.py --material AISI316L --method loo
+```
+
+- 可选参数：`--no-fp` 不使用 FP 特征；`--device cuda` 强制用 GPU。
+
+- 输出位置：`results/<材料名>/<材料名>_mflp_pinn_*`（csv/png）
