@@ -129,6 +129,51 @@ def build_mlp(input_dim: int, hidden_dims: list[int], dropout: float) -> nn.Sequ
     return nn.Sequential(*layers)
 
 
+class MultiTaskMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float):
+        super().__init__()
+        backbone_layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            backbone_layers.append(nn.Linear(prev_dim, hidden_dim))
+            backbone_layers.append(nn.ReLU())
+            if dropout > 0.0:
+                backbone_layers.append(nn.Dropout(p=float(dropout)))
+            prev_dim = hidden_dim
+        self.backbone = nn.Sequential(*backbone_layers)
+        self.life_head = nn.Linear(prev_dim, 1)
+        self.mech_head = nn.Linear(prev_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.backbone(x)
+        life = self.life_head(h).squeeze(-1)
+        mech_prob = torch.sigmoid(self.mech_head(h)).squeeze(-1)
+        return life, mech_prob
+
+
+def soft_binary_cross_entropy(pred_prob: torch.Tensor, target_soft: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    pred_clamped = torch.clamp(pred_prob, min=eps, max=1.0 - eps)
+    return F.binary_cross_entropy(pred_clamped, target_soft)
+
+
+def generate_soft_mechanism_label(material: str, gamma_a: float, epsilon_a: float) -> float:
+    ratio = gamma_a / epsilon_a if epsilon_a != 0 else 0.0
+    if material == 'TC4':
+        return 1.0 if ratio < 1.4 else (0.6 if ratio < 1.6 else 0.0)
+    if material == 'GH4169':
+        return 1.0 if ratio < 1.35 else (0.5 if ratio < 1.55 else 0.0)
+    if material == 'CuZn37':
+        if ratio < 1.0:
+            return 0.0
+        elif ratio < 1.55:
+            return 0.5
+        elif ratio <= 1.6:
+            return 0.6
+        else:
+            return 1.0
+    return -1.0
+
+
 def train_mflp_pinn(
     X_train: np.ndarray,
     y_train_log10: np.ndarray,
@@ -143,17 +188,20 @@ def train_mflp_pinn(
     lambda_nonneg: float,
     lambda_upper: float,
     lambda_fs: float,
+    lambda_mech: float,
     fp_train: np.ndarray,
+    mech_labels_train: np.ndarray,
     material_name: str,
     device: torch.device,
     grad_clip_norm: float | None = None,
 ):
-    model = build_mlp(X_train.shape[1], hidden_dims, dropout).to(device)
+    model = MultiTaskMLP(X_train.shape[1], hidden_dims, dropout).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
     X_tr = torch.from_numpy(X_train.astype(np.float32)).to(device)
     y_tr_log = torch.from_numpy(y_train_log10.astype(np.float32)).to(device)
     FP_tr = torch.from_numpy(fp_train.astype(np.float32)).to(device)
+    mech_tr = torch.from_numpy(mech_labels_train.astype(np.float32)).to(device)
 
     num_samples = X_tr.shape[0]
     num_batches = max(1, int(math.ceil(num_samples / max(1, batch_size))))
@@ -167,8 +215,8 @@ def train_mflp_pinn(
             x_b = X_tr.index_select(0, idx)
             y_b_log = y_tr_log.index_select(0, idx)
 
-            # 模型输出直接为预测疲劳寿命（单位：循环数 Np_pred）
-            Np_pred = model(x_b).squeeze(-1)
+            # 模型输出：寿命与机制概率
+            Np_pred, mech_prob = model(x_b)
 
             # 主损失：在 log10 空间与真实值进行 MSE
             pred_log = torch.log10(torch.clamp(Np_pred, min=1e-12))
@@ -180,9 +228,17 @@ def train_mflp_pinn(
 
             # FS 物理损失（与 main.py 一致）
             FP_b = FP_tr.index_select(0, idx)
-            loss_fs = fs_loss(Np_pred, FP_b, material_name) * float(lambda_fs)
+            loss_fs_val = fs_loss(Np_pred, FP_b, material_name) * float(lambda_fs)
 
-            loss = loss_mse + loss_phys_low + loss_phys_high + loss_fs
+            # 机制分类软标签损失（仅对有效标签计算）
+            mech_b = mech_tr.index_select(0, idx)
+            valid_mask = mech_b >= 0.0
+            if torch.any(valid_mask):
+                loss_mech = soft_binary_cross_entropy(mech_prob[valid_mask], mech_b[valid_mask]) * float(lambda_mech)
+            else:
+                loss_mech = torch.tensor(0.0, device=device)
+
+            loss = loss_mse + loss_phys_low + loss_phys_high + loss_fs_val + loss_mech
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -203,8 +259,25 @@ def train_mflp_pinn(
 def predict_cycles(model: nn.Module, X: np.ndarray, device: torch.device) -> np.ndarray:
     with torch.no_grad():
         X_t = torch.from_numpy(X.astype(np.float32)).to(device)
-        Np_pred = model(X_t).squeeze(-1)
+        if isinstance(model, MultiTaskMLP):
+            Np_pred, _ = model(X_t)
+        else:
+            Np_pred = model(X_t).squeeze(-1)
         return Np_pred.detach().cpu().numpy().astype(np.float64)
+
+
+def predict_outputs(model: nn.Module, X: np.ndarray, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+    with torch.no_grad():
+        X_t = torch.from_numpy(X.astype(np.float32)).to(device)
+        if isinstance(model, MultiTaskMLP):
+            Np_pred, mech_prob = model(X_t)
+        else:
+            Np_pred = model(X_t).squeeze(-1)
+            mech_prob = torch.zeros_like(Np_pred)
+        return (
+            Np_pred.detach().cpu().numpy().astype(np.float64),
+            mech_prob.detach().cpu().numpy().astype(np.float64),
+        )
 
 
 def evaluate_and_save_split(
@@ -214,6 +287,8 @@ def evaluate_and_save_split(
     test_idx: np.ndarray,
     Np_tr: np.ndarray,
     Np_te: np.ndarray,
+    Mech_tr: np.ndarray,
+    Mech_te: np.ndarray,
 ):
     meta = dataset['meta']
 
@@ -242,6 +317,7 @@ def evaluate_and_save_split(
             'Np_pred_mean': float(Np_tr[k]),
             'Np_pred_lo': float(Np_tr[k]),
             'Np_pred_hi': float(Np_tr[k]),
+            'mech_prob': float(Mech_tr[k]),
             'log_error': float(log_err_tr[k])
         })
     for k, j in enumerate(test_idx):
@@ -256,6 +332,7 @@ def evaluate_and_save_split(
             'Np_pred_mean': float(Np_te[k]),
             'Np_pred_lo': float(Np_te[k]),
             'Np_pred_hi': float(Np_te[k]),
+            'mech_prob': float(Mech_te[k]),
             'log_error': float(log_err_te[k])
         })
 
@@ -291,6 +368,7 @@ def evaluate_and_save_loo(
     material: str,
     dataset: dict,
     Np_pred_all: np.ndarray,
+    Mech_prob_all: np.ndarray,
 ):
     meta = dataset['meta']
     Nf_true = np.array([m['Nf'] for m in meta], dtype=np.float64)
@@ -310,6 +388,7 @@ def evaluate_and_save_loo(
             'Np_pred_mean': float(Np_pred_all[i]),
             'Np_pred_lo': float(Np_pred_all[i]),
             'Np_pred_hi': float(Np_pred_all[i]),
+            'mech_prob': float(Mech_prob_all[i]),
             'log_error': float(log_err[i])
         })
     import pandas as pd
@@ -353,6 +432,7 @@ def run_material_split(
     lambda_nonneg: float,
     lambda_upper: float,
     lambda_fs: float,
+    lambda_mech: float,
     test_ratio: float,
     seed: int,
     device: torch.device,
@@ -374,6 +454,11 @@ def run_material_split(
 
     # 取 FP 真值
     fp_all = np.array([m['FP'] for m in dataset['meta']], dtype=np.float64)
+    # 机制软标签
+    mech_all = np.array([
+        generate_soft_mechanism_label(material, float(m['gamma_a']), float(m['epsilon_a']))
+        for m in dataset['meta']
+    ], dtype=np.float64)
 
     # 训练
     model = train_mflp_pinn(
@@ -389,17 +474,19 @@ def run_material_split(
         lambda_nonneg=lambda_nonneg,
         lambda_upper=lambda_upper,
         lambda_fs=lambda_fs,
+        lambda_mech=lambda_mech,
         fp_train=fp_all[train_idx],
+        mech_labels_train=mech_all[train_idx],
         material_name=material,
         device=device,
         grad_clip_norm=1.0,
     )
 
-    # 预测（输出 cycles）
-    Np_tr = predict_cycles(model, Xz[train_idx], device=device)
-    Np_te = predict_cycles(model, Xz[test_idx], device=device)
+    # 预测（输出 cycles 与机制概率）
+    Np_tr, Mech_tr = predict_outputs(model, Xz[train_idx], device=device)
+    Np_te, Mech_te = predict_outputs(model, Xz[test_idx], device=device)
 
-    evaluate_and_save_split(material, dataset, train_idx, test_idx, Np_tr, Np_te)
+    evaluate_and_save_split(material, dataset, train_idx, test_idx, Np_tr, Np_te, Mech_tr, Mech_te)
 
 
 def run_material_loo(
@@ -416,6 +503,7 @@ def run_material_loo(
     lambda_nonneg: float,
     lambda_upper: float,
     lambda_fs: float,
+    lambda_mech: float,
     seed: int,
     device: torch.device,
 ):
@@ -431,7 +519,12 @@ def run_material_loo(
 
     n = Xz.shape[0]
     fp_all = np.array([m['FP'] for m in dataset['meta']], dtype=np.float64)
+    mech_all = np.array([
+        generate_soft_mechanism_label(material, float(m['gamma_a']), float(m['epsilon_a']))
+        for m in dataset['meta']
+    ], dtype=np.float64)
     Np_pred_all = np.zeros(n, dtype=np.float64)
+    Mech_prob_all = np.zeros(n, dtype=np.float64)
 
     rng = np.random.RandomState(int(seed))
     order = np.arange(n)
@@ -454,17 +547,20 @@ def run_material_loo(
             lambda_nonneg=lambda_nonneg,
             lambda_upper=lambda_upper,
             lambda_fs=lambda_fs,
+            lambda_mech=lambda_mech,
             fp_train=fp_all[mask],
+            mech_labels_train=mech_all[mask],
             material_name=material,
             device=device,
             grad_clip_norm=1.0,
         )
-        Np_pred_i = predict_cycles(model, Xz[i:i+1], device=device)[0]
-        Np_pred_all[i] = Np_pred_i
+        Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device)
+        Np_pred_all[i] = float(Np_pred_i[0])
+        Mech_prob_all[i] = float(Mech_prob_i[0])
         if (count + 1) % max(1, n // 10) == 0:
             print(f'LOO 进度: {count + 1}/{n}')
 
-    evaluate_and_save_loo(material, dataset, Np_pred_all)
+    evaluate_and_save_loo(material, dataset, Np_pred_all, Mech_prob_all)
 
 
 def parse_hidden_dims(text: str) -> list[int]:
@@ -493,6 +589,7 @@ def main():
     parser.add_argument('--lambda-nonneg', type=float, default=1.0, help='非负约束权重')
     parser.add_argument('--lambda-upper', type=float, default=0.1, help='上界约束权重')
     parser.add_argument('--lambda-fs', type=float, default=0.1, help='FS 物理损失权重')
+    parser.add_argument('--lambda-mech', type=float, default=0.3, help='机制分类软标签损失权重')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
 
     args = parser.parse_args()
@@ -525,6 +622,7 @@ def main():
                         lambda_nonneg=float(args.lambda_nonneg),
                         lambda_upper=float(args.lambda_upper),
                         lambda_fs=float(args.lambda_fs),
+                        lambda_mech=float(args.lambda_mech),
                         seed=int(args.seed),
                         device=dev,
                     )
@@ -542,6 +640,7 @@ def main():
                         lambda_nonneg=float(args.lambda_nonneg),
                         lambda_upper=float(args.lambda_upper),
                         lambda_fs=float(args.lambda_fs),
+                        lambda_mech=float(args.lambda_mech),
                         test_ratio=float(args.test_ratio),
                         seed=int(args.seed),
                         device=dev,
@@ -563,6 +662,7 @@ def main():
                 lambda_nonneg=float(args.lambda_nonneg),
                 lambda_upper=float(args.lambda_upper),
                 lambda_fs=float(args.lambda_fs),
+                lambda_mech=float(args.lambda_mech),
                 seed=int(args.seed),
                 device=dev,
             )
@@ -580,6 +680,7 @@ def main():
                 lambda_nonneg=float(args.lambda_nonneg),
                 lambda_upper=float(args.lambda_upper),
                 lambda_fs=float(args.lambda_fs),
+                lambda_mech=float(args.lambda_mech),
                 test_ratio=float(args.test_ratio),
                 seed=int(args.seed),
                 device=dev,
