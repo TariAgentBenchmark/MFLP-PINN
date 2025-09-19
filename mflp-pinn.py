@@ -116,33 +116,128 @@ def fs_loss(Np_pred: torch.Tensor, FP_true: torch.Tensor, material_name: str, ep
     return loss.mean()
 
 
+def _choose_transformer_heads(d_model: int) -> int:
+    for h in [8, 4, 2, 1]:
+        if d_model % h == 0:
+            return h
+    return 1
+
+
+def _resolve_transformer_dims(hidden_dims: list[int]) -> tuple[int, int, int]:
+    # d_model kept small for parameter efficiency
+    d_model = min(max(16, (hidden_dims[0] if hidden_dims else 64)), 64)
+    num_layers = max(1, min(len(hidden_dims), 2))
+    dim_feedforward = hidden_dims[1] if len(hidden_dims) >= 2 else max(64, 4 * d_model)
+    return d_model, num_layers, dim_feedforward
+
+
+def _build_sinusoidal_positional_encoding(seq_len: int, d_model: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    position = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, d_model, 2, device=device, dtype=dtype) * (-math.log(10000.0) / d_model))
+    pe = torch.zeros(seq_len, d_model, device=device, dtype=dtype)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
+
+
+class TransformerBackbone(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float):
+        super().__init__()
+        d_model, num_layers, dim_feedforward = _resolve_transformer_dims(hidden_dims)
+        nhead = _choose_transformer_heads(d_model)
+        self.input_dim = int(input_dim)
+        self.d_model = int(d_model)
+        self.input_proj = nn.Linear(1, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=int(dim_feedforward),
+            dropout=float(dropout),
+            activation='relu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=int(num_layers))
+        self.dropout = nn.Dropout(p=float(dropout)) if dropout > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, input_dim)
+        batch_size, feat_dim = x.shape
+        if feat_dim != self.input_dim:
+            # Guard against mismatch; truncate or pad with zeros to expected length (keeps interface robust)
+            if feat_dim > self.input_dim:
+                x = x[:, : self.input_dim]
+            else:
+                pad = torch.zeros(batch_size, self.input_dim - feat_dim, device=x.device, dtype=x.dtype)
+                x = torch.cat([x, pad], dim=1)
+        seq = x.unsqueeze(-1)  # (B, L, 1)
+        token = self.input_proj(seq)  # (B, L, d_model)
+        pe = _build_sinusoidal_positional_encoding(self.input_dim, self.d_model, token.device, token.dtype)
+        token = token + pe.unsqueeze(0)
+        h = self.encoder(token)  # (B, L, d_model)
+        h = self.dropout(h.mean(dim=1))  # mean-pool over feature positions -> (B, d_model)
+        return h
+
+
+class SmallTransformerRegressor(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float):
+        super().__init__()
+        self.backbone = TransformerBackbone(input_dim, hidden_dims, dropout)
+        self.head = nn.Linear(self.backbone.d_model, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.backbone(x)
+        return self.head(h)
+
+
+class MLPBackbone(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float):
+        super().__init__()
+        layers: list[nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(p=float(dropout)))
+            prev_dim = hidden_dim
+        self.network = nn.Sequential(*layers) if layers else nn.Identity()
+        self.output_dim = prev_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.network(x)
+        return h
+
+
+class SmallMLPRegressor(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float):
+        super().__init__()
+        self.backbone = MLPBackbone(input_dim, hidden_dims, dropout)
+        self.head = nn.Linear(self.backbone.output_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.backbone(x)
+        return self.head(h)
+
+
 def build_mlp(input_dim: int, hidden_dims: list[int], dropout: float) -> nn.Sequential:
-    layers: list[nn.Module] = []
-    prev_dim = input_dim
-    for hidden_dim in hidden_dims:
-        layers.append(nn.Linear(prev_dim, hidden_dim))
-        layers.append(nn.ReLU())
-        if dropout > 0.0:
-            layers.append(nn.Dropout(p=float(dropout)))
-        prev_dim = hidden_dim
-    layers.append(nn.Linear(prev_dim, 1))
-    return nn.Sequential(*layers)
+    # Return an actual MLP regressor for backward compatibility with the name
+    return nn.Sequential(SmallMLPRegressor(input_dim, hidden_dims, dropout))
 
 
 class MultiTaskMLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float):
+    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float, backbone: str = 'transformer'):
         super().__init__()
-        backbone_layers: list[nn.Module] = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            backbone_layers.append(nn.Linear(prev_dim, hidden_dim))
-            backbone_layers.append(nn.ReLU())
-            if dropout > 0.0:
-                backbone_layers.append(nn.Dropout(p=float(dropout)))
-            prev_dim = hidden_dim
-        self.backbone = nn.Sequential(*backbone_layers)
-        self.life_head = nn.Linear(prev_dim, 1)
-        self.mech_head = nn.Linear(prev_dim, 1)
+        backbone = (backbone or 'transformer').lower()
+        if backbone == 'mlp':
+            bb = MLPBackbone(input_dim, hidden_dims, dropout)
+            out_dim = bb.output_dim
+        else:
+            bb = TransformerBackbone(input_dim, hidden_dims, dropout)
+            out_dim = bb.d_model
+        self.backbone = bb
+        self.life_head = nn.Linear(out_dim, 1)
+        self.mech_head = nn.Linear(out_dim, 1)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.backbone(x)
@@ -195,12 +290,16 @@ def train_mflp_pinn(
     device: torch.device,
     grad_clip_norm: float | None = None,
     mtl_enabled: bool = True,
+    backbone: str = 'transformer',
 ):
     model: nn.Module
     if mtl_enabled:
-        model = MultiTaskMLP(X_train.shape[1], hidden_dims, dropout).to(device)
+        model = MultiTaskMLP(X_train.shape[1], hidden_dims, dropout, backbone=backbone).to(device)
     else:
-        model = build_mlp(X_train.shape[1], hidden_dims, dropout).to(device)
+        if (backbone or 'transformer').lower() == 'mlp':
+            model = build_mlp(X_train.shape[1], hidden_dims, dropout).to(device)
+        else:
+            model = SmallTransformerRegressor(X_train.shape[1], hidden_dims, dropout).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
     X_tr = torch.from_numpy(X_train.astype(np.float32)).to(device)
@@ -366,9 +465,16 @@ def evaluate_and_save_split(
     plt.scatter(Nf_te, Np_te, alpha=0.95, label='Test', c='#d62728', s=120, edgecolors='k', linewidths=0.5, zorder=3)
     mn = min(float(np.min(np.concatenate([Nf_tr, Nf_te]))), float(np.min(np.concatenate([Np_tr, Np_te]))))
     mx = max(float(np.max(np.concatenate([Nf_tr, Nf_te]))), float(np.max(np.concatenate([Np_tr, Np_te]))))
-    plt.plot([mn, mx], [mn, mx], 'r--', label='Perfect')
-    plt.plot([mn, mx], [mn / 2.0, mx / 2.0], 'k:', label='Factor of 2')
-    plt.plot([mn, mx], [mn * 2.0, mx * 2.0], 'k:')
+    plt.plot([mn, mx], [mn, mx], color='#d62728', linestyle='--', linewidth=1.8, label='Perfect')
+    # Factor of 1.5 (green dashdot)
+    plt.plot([mn, mx], [mn / 1.5, mx / 1.5], color='#2ca02c', linestyle='-.', linewidth=2.0, label='Factor of 1.5')
+    plt.plot([mn, mx], [mn * 1.5, mx * 1.5], color='#2ca02c', linestyle='-.', linewidth=2.0)
+    # Factor of 2 (black dotted, thicker)
+    plt.plot([mn, mx], [mn / 2.0, mx / 2.0], color='#000000', linestyle=':', linewidth=2.4, label='Factor of 2')
+    plt.plot([mn, mx], [mn * 2.0, mx * 2.0], color='#000000', linestyle=':', linewidth=2.4)
+    # Factor of 3 (purple solid)
+    plt.plot([mn, mx], [mn / 3.0, mx / 3.0], color='#9467bd', linestyle='-', linewidth=2.0, label='Factor of 3')
+    plt.plot([mn, mx], [mn * 3.0, mx * 3.0], color='#9467bd', linestyle='-', linewidth=2.0)
     plt.xscale('log')
     plt.yscale('log')
     plt.xlabel('True Life (Nf)')
@@ -420,9 +526,16 @@ def evaluate_and_save_loo(
     plt.scatter(Nf_true, Np_pred_all, alpha=0.7, label='Predicted')
     mn = min(float(np.min(Nf_true)), float(np.min(Np_pred_all)))
     mx = max(float(np.max(Nf_true)), float(np.max(Np_pred_all)))
-    plt.plot([mn, mx], [mn, mx], 'r--', label='Perfect')
-    plt.plot([mn, mx], [mn / 2.0, mx / 2.0], 'k:', label='Factor of 2')
-    plt.plot([mn, mx], [mn * 2.0, mx * 2.0], 'k:')
+    plt.plot([mn, mx], [mn, mx], color='#d62728', linestyle='--', linewidth=1.8, label='Perfect')
+    # Factor of 1.5 (green dashdot)
+    plt.plot([mn, mx], [mn / 1.5, mx / 1.5], color='#2ca02c', linestyle='-.', linewidth=2.0, label='Factor of 1.5')
+    plt.plot([mn, mx], [mn * 1.5, mx * 1.5], color='#2ca02c', linestyle='-.', linewidth=2.0)
+    # Factor of 2 (black dotted, thicker)
+    plt.plot([mn, mx], [mn / 2.0, mx / 2.0], color='#000000', linestyle=':', linewidth=2.4, label='Factor of 2')
+    plt.plot([mn, mx], [mn * 2.0, mx * 2.0], color='#000000', linestyle=':', linewidth=2.4)
+    # Factor of 3 (purple solid)
+    plt.plot([mn, mx], [mn / 3.0, mx / 3.0], color='#9467bd', linestyle='-', linewidth=2.0, label='Factor of 3')
+    plt.plot([mn, mx], [mn * 3.0, mx * 3.0], color='#9467bd', linestyle='-', linewidth=2.0)
     plt.xscale('log')
     plt.yscale('log')
     plt.xlabel('True Life (Nf)')
@@ -455,6 +568,7 @@ def run_material_split(
     seed: int,
     device: torch.device,
     mtl_enabled: bool,
+    backbone: str,
 ):
     print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，Train/Test 分色)')
     dataset = build_dataset(material, include_fp=include_fp)
@@ -500,6 +614,7 @@ def run_material_split(
         device=device,
         grad_clip_norm=1.0,
         mtl_enabled=mtl_enabled,
+            backbone=backbone,
     )
 
     # 预测（输出 cycles 与机制概率）
@@ -527,6 +642,7 @@ def run_material_loo(
     seed: int,
     device: torch.device,
     mtl_enabled: bool,
+    backbone: str,
 ):
     print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，LOO)')
     dataset = build_dataset(material, include_fp=include_fp)
@@ -575,6 +691,7 @@ def run_material_loo(
             device=device,
             grad_clip_norm=1.0,
             mtl_enabled=mtl_enabled,
+            backbone=backbone,
         )
         Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device)
         Np_pred_all[i] = float(Np_pred_i[0])
@@ -614,6 +731,7 @@ def main():
     parser.add_argument('--lambda-mech', type=float, default=0.3, help='机制分类软标签损失权重')
     parser.add_argument('--no-mtl', action='store_true', help='关闭多任务（仅寿命预测）')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
+    parser.add_argument('--backbone', type=str, default='transformer', choices=['mlp', 'transformer'], help='选择回骨网络：mlp 或 transformer')
 
     args = parser.parse_args()
 
@@ -623,6 +741,7 @@ def main():
 
     include_fp = (not args.no_fp)
     mtl_enabled = (not args.no_mtl)
+    backbone = args.backbone.lower()
 
     if args.material == 'ALL':
         materials = get_available_materials()
@@ -650,6 +769,7 @@ def main():
                         mtl_enabled=mtl_enabled,
                         seed=int(args.seed),
                         device=dev,
+                        backbone=backbone,
                     )
                 else:
                     run_material_split(
@@ -670,6 +790,7 @@ def main():
                         test_ratio=float(args.test_ratio),
                         seed=int(args.seed),
                         device=dev,
+                        backbone=backbone,
                     )
             except Exception as e:
                 print(f"处理 {mat} 时发生错误: {e}")
@@ -692,6 +813,7 @@ def main():
                 mtl_enabled=mtl_enabled,
                 seed=int(args.seed),
                 device=dev,
+                backbone=backbone,
             )
         else:
             run_material_split(
@@ -712,6 +834,7 @@ def main():
                 test_ratio=float(args.test_ratio),
                 seed=int(args.seed),
                 device=dev,
+                backbone=backbone,
             )
 
 
