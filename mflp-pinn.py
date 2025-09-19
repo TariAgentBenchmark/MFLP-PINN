@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -10,19 +11,302 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 复用数据与IO函数
-from bayesian_timeseries import (
-    DATA_DIRS,
-    build_dataset,
-    get_output_path,
-    get_available_materials,
-    train_test_split_indices,
-)
-
 
 # 切到脚本所在目录，确保相对路径正确
 script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
 os.chdir(script_dir)
+
+
+# 数据目录（与 main.py 保持一致）
+DATA_DIRS = {
+    'AISI316L': {
+        'strain_series': 'data/AISI316L应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/AISI316L多轴疲劳试验数据.xls'
+    },
+    'GH4169': {
+        'strain_series': 'data/GH4169应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/GH4169多轴疲劳试验数据.xls'
+    },
+    'TC4': {
+        'strain_series': 'data/TC4应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/TC4多轴疲劳试验数据.xls'
+    },
+    'CuZn37': {
+        'strain_series': 'data/CuZn37应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/CuZn37黄铜多轴疲劳试验数据.xls'
+    },
+    'Q235B1': {
+        'strain_series': 'data/Q235B基础金属应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/Q235B1.xls'
+    },
+    'Q235B2': {
+        'strain_series': 'data/Q235B焊接金属应变时间序列数据',
+        'fatigue_data': 'data/多轴疲劳试验数据/Q235B2.xls'
+    }
+}
+
+
+def get_strain_series_path(material_name: str) -> str:
+    return DATA_DIRS[material_name]['strain_series']
+
+
+def get_fatigue_data_path(material_name: str) -> str:
+    return DATA_DIRS[material_name]['fatigue_data']
+
+
+def get_output_path(material_name: str, file_name: str) -> str:
+    base_dir = os.path.join(os.getcwd(), 'results')
+    os.makedirs(base_dir, exist_ok=True)
+    material_dir = os.path.join(base_dir, material_name)
+    os.makedirs(material_dir, exist_ok=True)
+    return os.path.join(material_dir, file_name)
+
+
+def parse_strain_values_from_filename(filename: str):
+    parts = filename.replace('strain_series_', '').replace('.xls', '').replace('.csv', '').split('_')
+    return float(parts[0]), float(parts[1])
+
+
+def read_strain_series(file_path: str):
+    if os.path.getsize(file_path) == 0:
+        raise ValueError('文件为空')
+    if file_path.endswith('.csv'):
+        encodings = ['utf-8', 'gbk', 'gb2312', 'latin1']
+        df = None
+        for enc in encodings:
+            try:
+                df = pd.read_csv(file_path, encoding=enc)
+                break
+            except UnicodeDecodeError:
+                pass
+        if df is None:
+            raise ValueError('CSV 编码无法识别')
+    else:
+        df = pd.read_excel(file_path)
+
+    required_columns = ['Time (s)', 'Normal Strain', 'Shear Strain']
+    for c in required_columns:
+        if c not in df.columns:
+            raise ValueError(f'缺少必要列: {c}')
+
+    time = df['Time (s)'].astype(np.float64).to_numpy()
+    normal = df['Normal Strain'].astype(np.float64).to_numpy()
+    shear = df['Shear Strain'].astype(np.float64).to_numpy()
+
+    if np.any(~np.isfinite(time)) or np.any(~np.isfinite(normal)) or np.any(~np.isfinite(shear)):
+        raise ValueError('数据包含非有限值')
+
+    return time, normal, shear
+
+
+def read_fatigue_data(file_path: str):
+    excel = pd.ExcelFile(file_path)
+    epsilon_a, gamma_a, Nf, FP = [], [], [], []
+    for sheet in excel.sheet_names:
+        df = pd.read_excel(file_path, sheet_name=sheet)
+        if df.shape[1] < 6:
+            continue
+        epsilon_a.extend(df.iloc[:, 0].to_numpy())
+        gamma_a.extend(df.iloc[:, 1].to_numpy())
+        Nf.extend(df.iloc[:, 2].to_numpy())
+        FP.extend(df.iloc[:, 5].to_numpy())
+    return np.array(epsilon_a, dtype=np.float64), np.array(gamma_a, dtype=np.float64), np.array(Nf, dtype=np.float64), np.array(FP, dtype=np.float64)
+
+
+# 特征工程
+def _safe_stat(x: np.ndarray, fn):
+    v = fn(x)
+    return float(v) if np.isfinite(v) else 0.0
+
+
+def _skewness(x: np.ndarray) -> float:
+    n = x.size
+    if n < 3:
+        return 0.0
+    xm = x - np.mean(x)
+    s = np.std(xm)
+    if s == 0.0:
+        return 0.0
+    m3 = np.mean(xm ** 3)
+    return float(m3 / (s ** 3))
+
+
+def _kurtosis(x: np.ndarray) -> float:
+    n = x.size
+    if n < 4:
+        return 0.0
+    xm = x - np.mean(x)
+    s = np.std(xm)
+    if s == 0.0:
+        return 0.0
+    m4 = np.mean(xm ** 4)
+    return float(m4 / (s ** 4) - 3.0)
+
+
+def _rms(x: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(x ** 2)))
+
+
+def _autocorr_lag1(x: np.ndarray) -> float:
+    if x.size < 2:
+        return 0.0
+    x0 = x[:-1]
+    x1 = x[1:]
+    s0 = np.std(x0)
+    s1 = np.std(x1)
+    if s0 == 0 or s1 == 0:
+        return 0.0
+    return float(np.corrcoef(x0, x1)[0, 1])
+
+
+def _corrcoef(x: np.ndarray, y: np.ndarray) -> float:
+    sx = np.std(x)
+    sy = np.std(y)
+    if sx == 0 or sy == 0:
+        return 0.0
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _fft_features(time: np.ndarray, x: np.ndarray):
+    n = x.size
+    if n < 8:
+        return 0.0, 0.0, 0.0
+    dt_raw = np.diff(time)
+    dt = float(np.median(dt_raw)) if dt_raw.size > 0 else 0.0
+    if not np.isfinite(dt) or dt <= 0:
+        return 0.0, 0.0, 0.0
+    x_d = x - np.mean(x)
+    X = np.fft.rfft(x_d)
+    freqs = np.fft.rfftfreq(n, d=dt)
+    P = np.abs(X) ** 2
+    if P.sum() <= 0.0:
+        return 0.0, 0.0, 0.0
+    # 主频率（去掉直流分量）
+    if P.size > 1:
+        idx = 1 + int(np.argmax(P[1:]))
+        f_dom = float(freqs[idx])
+    else:
+        f_dom = 0.0
+    # 频谱质心
+    centroid = float(np.sum(freqs * P) / np.sum(P))
+    # 频谱熵（归一化到 [0,1]）
+    p = P / np.sum(P)
+    p = np.where(p > 0, p, 1e-12)
+    entropy = float(-np.sum(p * np.log(p)) / np.log(p.size))
+    return f_dom, centroid, entropy
+
+
+def compute_features(time: np.ndarray, normal: np.ndarray, shear: np.ndarray) -> np.ndarray:
+    # 基础统计
+    feats = []
+    for arr in (normal, shear):
+        feats.append(_safe_stat(arr, np.mean))
+        feats.append(_safe_stat(arr, np.std))
+        feats.append(_safe_stat(arr, np.min))
+        feats.append(_safe_stat(arr, np.max))
+        feats.append(float(np.max(arr) - np.min(arr)))
+        feats.append(_rms(arr))
+        feats.append(_skewness(arr))
+        feats.append(_kurtosis(arr))
+        feats.append(_autocorr_lag1(arr))
+        f_dom, f_cent, f_ent = _fft_features(time, arr)
+        feats.extend([f_dom, f_cent, f_ent])
+    # 交互特征
+    feats.append(_corrcoef(normal, shear))
+    return np.array(feats, dtype=np.float64)
+
+
+# 构建数据集（按材料）
+def build_dataset(material_name: str, include_fp: bool = True):
+    strain_dir = get_strain_series_path(material_name)
+    fatigue_path = get_fatigue_data_path(material_name)
+    if not os.path.exists(strain_dir):
+        raise FileNotFoundError(f'找不到应变时间序列文件夹: {strain_dir}')
+    if not os.path.exists(fatigue_path):
+        raise FileNotFoundError(f'找不到疲劳数据文件: {fatigue_path}')
+
+    # 预扫描时间序列 -> 特征
+    feature_map = {}
+    file_map = {}
+    for fname in os.listdir(strain_dir):
+        if not (fname.startswith('strain_series_') and (fname.endswith('.xls') or fname.endswith('.csv'))):
+            continue
+        ea, ga = parse_strain_values_from_filename(fname)
+        key = (round(float(ea), 5), round(float(ga), 5))
+        path = os.path.join(strain_dir, fname)
+        time, normal, shear = read_strain_series(path)
+        feats = compute_features(time, normal, shear)
+        feature_map[key] = feats
+        file_map[key] = fname
+
+    eps_all, gam_all, Nf_all, FP_all = read_fatigue_data(fatigue_path)
+
+    X_list, y_list = [], []
+    meta = []
+    for i in range(eps_all.size):
+        key = (round(float(eps_all[i]), 5), round(float(gam_all[i]), 5))
+        if key not in feature_map:
+            continue
+        feats = feature_map[key]
+        # 将幅值与 FP 作为额外特征
+        extra = [float(eps_all[i]), float(gam_all[i])]
+        if include_fp:
+            extra.append(float(FP_all[i]))
+        x = np.concatenate([feats, np.array(extra, dtype=np.float64)])
+        X_list.append(x)
+        y_list.append(math.log10(float(Nf_all[i])))
+        meta.append({
+            'file': file_map.get(key, ''),
+            'epsilon_a': float(eps_all[i]),
+            'gamma_a': float(gam_all[i]),
+            'FP': float(FP_all[i]),
+            'Nf': float(Nf_all[i])
+        })
+
+    if len(X_list) == 0:
+        raise ValueError('没有任何匹配的数据对（时间序列 与 疲劳表格）')
+
+    X = np.vstack(X_list)
+    y = np.array(y_list, dtype=np.float64)
+
+    # 标准化（全局）
+    mu = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma = np.where(sigma > 0, sigma, 1.0)
+    Xz = (X - mu) / sigma
+    # 设计矩阵（加截距）
+    Phi = np.concatenate([np.ones((Xz.shape[0], 1)), Xz], axis=1)
+
+    return {
+        'Phi': Phi,
+        'X': X,
+        'y': y,
+        'mu': mu,
+        'sigma': sigma,
+        'meta': meta
+    }
+
+
+def train_test_split_indices(n: int, test_ratio: float = 0.2, seed: int = 42):
+    rng = np.random.RandomState(seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    t = int(round(n * (1.0 - test_ratio)))
+    train_idx = np.sort(idx[:t])
+    test_idx = np.sort(idx[t:])
+    return train_idx, test_idx
+
+
+def get_available_materials():
+    mats = []
+    for material_name in DATA_DIRS.keys():
+        strain_series_path = get_strain_series_path(material_name)
+        if os.path.exists(strain_series_path):
+            files = [f for f in os.listdir(strain_series_path)
+                     if f.startswith('strain_series_') and (f.endswith('.xls') or f.endswith('.csv'))]
+            if files:
+                mats.append(material_name)
+    return mats
 
 
 def seed_everything(seed: int = 42):
