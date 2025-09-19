@@ -7,7 +7,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 - 在项目根目录同步环境（将按 pyproject.toml 自动安装 Python 3.12 和依赖）：
 ```bash
-cd /home/hanbing/data/parttime/MFLP-PINN
+cd .
 uv sync
 ```
 
@@ -18,32 +18,12 @@ pip install -i https://mirrors.aliyun.com/pypi/simple/ -r req.txt
 
 ## 运行程序
 
-### Bayesian 时间序列（不确定性估计）
-
-- ALL 材料，随机划分 train/test：
-```bash
-uv run python /home/hanbing/data/parttime/MFLP-PINN/bayesian_timeseries.py --material ALL --method split --test-ratio 0.2 --seed 42
+transformer + pinn
+```
+python mflp-pinn.py --epoch 5000
 ```
 
-- 单一材料，留一验证（LOO）：
-```bash
-uv run python /home/hanbing/data/parttime/MFLP-PINN/bayesian_timeseries.py --material AISI316L --method loo --ci 0.95
+其余运行参数可以查看
 ```
-
-- 输出位置：`results/<材料名>/<材料名>_bayes_timeseries_*`（csv/png）
-
-### MFLP-PINN（物理约束 PINN）
-
-- ALL 材料，train/test：
-```bash
-uv run python /home/hanbing/data/parttime/MFLP-PINN/mflp-pinn.py --material ALL --method split --hidden-dims 128,64 --epochs 1500 --upper-cycles 1e7
+python mflp-pinn.py --help查看
 ```
-
-- 单一材料，LOO（脚本内默认缩短轮数以加速）：
-```bash
-uv run python /home/hanbing/data/parttime/MFLP-PINN/mflp-pinn.py --material AISI316L --method loo
-```
-
-- 可选参数：`--no-fp` 不使用 FP 特征；`--device cuda` 强制用 GPU。
-
-- 输出位置：`results/<材料名>/<材料名>_mflp_pinn_*`（csv/png）
