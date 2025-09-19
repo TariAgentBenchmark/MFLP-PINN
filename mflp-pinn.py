@@ -575,6 +575,11 @@ def train_mflp_pinn(
     grad_clip_norm: float | None = None,
     mtl_enabled: bool = True,
     backbone: str = 'transformer',
+    # 可选验证集，用于绘制 loss 曲线
+    X_val: np.ndarray | None = None,
+    y_val_log10: np.ndarray | None = None,
+    fp_val: np.ndarray | None = None,
+    mech_labels_val: np.ndarray | None = None,
 ):
     model: nn.Module
     if mtl_enabled:
@@ -594,10 +599,25 @@ def train_mflp_pinn(
     num_samples = X_tr.shape[0]
     num_batches = max(1, int(math.ceil(num_samples / max(1, batch_size))))
 
+    # 记录损失历史
+    history = {
+        'train_total': [],
+        'val_total': [],
+        'train_data': [],
+        'val_data': [],
+        'train_phys': [],
+        'val_phys': [],
+        'train_mech': [],
+        'val_mech': [],
+    }
+
     model.train()
     for epoch in range(int(epochs)):
         perm = torch.randperm(num_samples, device=device)
         epoch_loss = 0.0
+        epoch_data = 0.0
+        epoch_phys = 0.0
+        epoch_mech = 0.0
         for b in range(num_batches):
             idx = perm[b * batch_size : (b + 1) * batch_size]
             x_b = X_tr.index_select(0, idx)
@@ -643,13 +663,60 @@ def train_mflp_pinn(
             optimizer.step()
 
             epoch_loss += float(loss.detach().cpu())
+            epoch_data += float(loss_mse.detach().cpu())
+            epoch_phys += float((loss_phys_low + loss_phys_high + loss_fs_val).detach().cpu())
+            epoch_mech += float((loss_mech if mtl_enabled else torch.tensor(0.0, device=device)).detach().cpu())
 
         # 可选打印
         if (epoch + 1) % max(1, int(epochs // 10)) == 0:
             print(f'Epoch {epoch + 1}/{epochs} - loss: {epoch_loss / num_batches:.6f}')
 
+        # 记录训练集 epoch 平均
+        history['train_total'].append(epoch_loss / num_batches)
+        history['train_data'].append(epoch_data / num_batches)
+        history['train_phys'].append(epoch_phys / num_batches)
+        history['train_mech'].append(epoch_mech / num_batches)
+
+        # 验证损失（若提供）
+        if X_val is not None and y_val_log10 is not None and fp_val is not None:
+            with torch.no_grad():
+                model.eval()
+                Xv = torch.from_numpy(X_val.astype(np.float32)).to(device)
+                yv = torch.from_numpy(y_val_log10.astype(np.float32)).to(device)
+                FPv = torch.from_numpy(fp_val.astype(np.float32)).to(device)
+                if mtl_enabled and mech_labels_val is not None:
+                    Mechv = torch.from_numpy(mech_labels_val.astype(np.float32)).to(device)
+                else:
+                    Mechv = None
+
+                if isinstance(model, MultiTaskMLP):
+                    mu_log_v, mech_prob_v = model(Xv)
+                else:
+                    mu_log_v = model(Xv).squeeze(-1)
+                    mech_prob_v = torch.zeros_like(mu_log_v)
+                Np_v = torch.pow(10.0, mu_log_v)
+                v_data = F.mse_loss(mu_log_v, yv)
+                v_low = F.relu(-Np_v).mean() * float(lambda_nonneg)
+                v_high = F.relu(Np_v - float(upper_cycle_limit)).mean() * float(lambda_upper)
+                v_fs = fs_loss(Np_v, FPv, material_name) * float(lambda_fs)
+                if mtl_enabled and Mechv is not None:
+                    v_mask = Mechv >= 0.0
+                    if torch.any(v_mask):
+                        v_mech = soft_binary_cross_entropy(mech_prob_v[v_mask], Mechv[v_mask]) * float(lambda_mech)
+                    else:
+                        v_mech = torch.tensor(0.0, device=device)
+                else:
+                    v_mech = torch.tensor(0.0, device=device)
+                v_phys = v_low + v_high + v_fs
+                v_total = v_data + v_phys + v_mech
+                history['val_total'].append(float(v_total.detach().cpu()))
+                history['val_data'].append(float(v_data.detach().cpu()))
+                history['val_phys'].append(float(v_phys.detach().cpu()))
+                history['val_mech'].append(float(v_mech.detach().cpu()))
+                model.train()
+
     model.eval()
-    return model
+    return model, history
 
 
 def predict_cycles(model: nn.Module, X: np.ndarray, device: torch.device) -> np.ndarray:
@@ -679,6 +746,43 @@ def predict_outputs(model: nn.Module, X: np.ndarray, device: torch.device) -> tu
             Np_pred.detach().cpu().numpy().astype(np.float64),
             mech_prob.detach().cpu().numpy().astype(np.float64),
         )
+
+
+def plot_loss_history(material: str, history: dict):
+    # 若没有有效历史，直接返回
+    if not history or len(history.get('train_total', [])) == 0:
+        return
+    epochs = np.arange(1, len(history['train_total']) + 1)
+    plt.figure(figsize=(10, 6))
+    # 训练与验证总损失
+    plt.plot(epochs, history['train_total'], color='blue', linewidth=2.0, label='Train Total Loss')
+    if len(history.get('val_total', [])) == len(epochs):
+        plt.plot(epochs, history['val_total'], color='red', linewidth=2.0, label='Val Total Loss')
+    # 数据项
+    if len(history.get('train_data', [])) == len(epochs):
+        plt.plot(epochs, history['train_data'], color='blue', linestyle='--', linewidth=1.5, label='Train Data Loss')
+    if len(history.get('val_data', [])) == len(epochs):
+        plt.plot(epochs, history['val_data'], color='red', linestyle='--', linewidth=1.5, label='Val Data Loss')
+    # 物理项
+    if len(history.get('train_phys', [])) == len(epochs):
+        plt.plot(epochs, history['train_phys'], color='green', linestyle=':', linewidth=2.0, label='Train Physical Loss')
+    if len(history.get('val_phys', [])) == len(epochs):
+        plt.plot(epochs, history['val_phys'], color='green', linestyle=':', linewidth=2.0, alpha=0.8, label='Val Physical Loss')
+    # 机制项
+    if len(history.get('train_mech', [])) == len(epochs):
+        plt.plot(epochs, history['train_mech'], color='cyan', linestyle='--', linewidth=1.5, label='Train Mech Loss')
+    if len(history.get('val_mech', [])) == len(epochs):
+        plt.plot(epochs, history['val_mech'], color='magenta', linestyle='--', linewidth=1.5, label='Val Mech Loss')
+
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss Value')
+    plt.title(f'{material} Training Loss History')
+    plt.grid(True, alpha=0.5)
+    plt.legend()
+    plot_path = get_output_path(material, f'{material}_loss_history.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f'训练/验证损失曲线已保存: {plot_path}')
 
 
 def evaluate_and_save_split(
@@ -878,7 +982,7 @@ def run_material_split(
     ], dtype=np.float64)
 
     # 训练
-    model = train_mflp_pinn(
+    model, history = train_mflp_pinn(
         X_train=Xz[train_idx],
         y_train_log10=y_log[train_idx],
         hidden_dims=hidden_dims,
@@ -899,6 +1003,11 @@ def run_material_split(
         grad_clip_norm=1.0,
         mtl_enabled=mtl_enabled,
             backbone=backbone,
+        # 验证集（用于绘制曲线）
+        X_val=Xz[test_idx],
+        y_val_log10=y_log[test_idx],
+        fp_val=fp_all[test_idx],
+        mech_labels_val=mech_all[test_idx] if mtl_enabled else None,
     )
 
     # 预测（输出 cycles 与机制概率）
@@ -906,6 +1015,8 @@ def run_material_split(
     Np_te, Mech_te = predict_outputs(model, Xz[test_idx], device=device)
 
     evaluate_and_save_split(material, dataset, train_idx, test_idx, Np_tr, Np_te, Mech_tr, Mech_te)
+    # 绘制并保存 loss 曲线
+    plot_loss_history(material, history)
 
 
 def run_material_loo(
@@ -955,7 +1066,7 @@ def run_material_loo(
     for count, i in enumerate(order):
         mask = np.ones(n, dtype=bool)
         mask[i] = False
-        model = train_mflp_pinn(
+        model, _ = train_mflp_pinn(
             X_train=Xz[mask],
             y_train_log10=y_log[mask],
             hidden_dims=hidden_dims,
@@ -1017,7 +1128,9 @@ def main():
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
     parser.add_argument('--backbone', type=str, default='transformer', choices=['mlp', 'transformer'], help='选择回骨网络：mlp 或 transformer')
 
-    args = parser.parse_args()
+    args = parser.parse_args(
+        ["--epochs", "100"]
+    )
 
     seed_everything(int(args.seed))
     dev = torch.device('cuda' if (args.device == 'cuda' or (args.device == 'auto' and torch.cuda.is_available())) else 'cpu')
@@ -1122,7 +1235,6 @@ def main():
             )
 
 
-if __name__ == '__main__':
-    main()
+main()
 
 
