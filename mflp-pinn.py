@@ -221,21 +221,23 @@ def train_mflp_pinn(
             y_b_log = y_tr_log.index_select(0, idx)
 
             if mtl_enabled:
-                # 模型输出：寿命与机制概率
-                Np_pred, mech_prob = model(x_b)
+                # 模型输出：预测 log10(Np) 与机制概率
+                mu_log_pred, mech_prob = model(x_b)
             else:
-                # 单任务：仅寿命
-                Np_pred = model(x_b).squeeze(-1)
+                # 单任务：仅预测 log10(Np)
+                mu_log_pred = model(x_b).squeeze(-1)
 
-            # 主损失：在 log10 空间与真实值进行 MSE
-            pred_log = torch.log10(torch.clamp(Np_pred, min=1e-12))
-            loss_mse = F.mse_loss(pred_log, y_b_log)
+            # 将 log10(Np) 指标还原为线性 Np 以用于物理项
+            Np_pred = torch.pow(10.0, mu_log_pred)
 
-            # 物理约束：非负与上界（例如 1e7 次循环）
+            # 主损失：直接在 log10 空间与真实值进行 MSE（数值更稳定）
+            loss_mse = F.mse_loss(mu_log_pred, y_b_log)
+
+            # 物理约束：非负与上界（对线性 Np 约束，例如 1e7 次循环）
             loss_phys_low = F.relu(-Np_pred).mean() * float(lambda_nonneg)
             loss_phys_high = F.relu(Np_pred - float(upper_cycle_limit)).mean() * float(lambda_upper)
 
-            # FS 物理损失（与 main.py 一致）
+            # FS 物理损失（基于线性 Np）
             FP_b = FP_tr.index_select(0, idx)
             loss_fs_val = fs_loss(Np_pred, FP_b, material_name) * float(lambda_fs)
 
@@ -270,21 +272,26 @@ def train_mflp_pinn(
 def predict_cycles(model: nn.Module, X: np.ndarray, device: torch.device) -> np.ndarray:
     with torch.no_grad():
         X_t = torch.from_numpy(X.astype(np.float32)).to(device)
+        # 模型输出的是 mu_log = log10(Np)
         if isinstance(model, MultiTaskMLP):
-            Np_pred, _ = model(X_t)
+            mu_log, _ = model(X_t)
         else:
-            Np_pred = model(X_t).squeeze(-1)
+            mu_log = model(X_t).squeeze(-1)
+        Np_pred = torch.pow(10.0, mu_log)
         return Np_pred.detach().cpu().numpy().astype(np.float64)
 
 
 def predict_outputs(model: nn.Module, X: np.ndarray, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
     with torch.no_grad():
         X_t = torch.from_numpy(X.astype(np.float32)).to(device)
+        # 输出 mu_log = log10(Np)，再转回线性空间
         if isinstance(model, MultiTaskMLP):
-            Np_pred, mech_prob = model(X_t)
+            mu_log, mech_prob = model(X_t)
+            Np_pred = torch.pow(10.0, mu_log)
         else:
-            Np_pred = model(X_t).squeeze(-1)
-            mech_prob = torch.zeros_like(Np_pred)
+            mu_log = model(X_t).squeeze(-1)
+            Np_pred = torch.pow(10.0, mu_log)
+            mech_prob = torch.zeros_like(mu_log)
         return (
             Np_pred.detach().cpu().numpy().astype(np.float64),
             mech_prob.detach().cpu().numpy().astype(np.float64),
