@@ -194,8 +194,13 @@ def train_mflp_pinn(
     material_name: str,
     device: torch.device,
     grad_clip_norm: float | None = None,
+    mtl_enabled: bool = True,
 ):
-    model = MultiTaskMLP(X_train.shape[1], hidden_dims, dropout).to(device)
+    model: nn.Module
+    if mtl_enabled:
+        model = MultiTaskMLP(X_train.shape[1], hidden_dims, dropout).to(device)
+    else:
+        model = build_mlp(X_train.shape[1], hidden_dims, dropout).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
     X_tr = torch.from_numpy(X_train.astype(np.float32)).to(device)
@@ -215,8 +220,12 @@ def train_mflp_pinn(
             x_b = X_tr.index_select(0, idx)
             y_b_log = y_tr_log.index_select(0, idx)
 
-            # 模型输出：寿命与机制概率
-            Np_pred, mech_prob = model(x_b)
+            if mtl_enabled:
+                # 模型输出：寿命与机制概率
+                Np_pred, mech_prob = model(x_b)
+            else:
+                # 单任务：仅寿命
+                Np_pred = model(x_b).squeeze(-1)
 
             # 主损失：在 log10 空间与真实值进行 MSE
             pred_log = torch.log10(torch.clamp(Np_pred, min=1e-12))
@@ -230,15 +239,17 @@ def train_mflp_pinn(
             FP_b = FP_tr.index_select(0, idx)
             loss_fs_val = fs_loss(Np_pred, FP_b, material_name) * float(lambda_fs)
 
-            # 机制分类软标签损失（仅对有效标签计算）
-            mech_b = mech_tr.index_select(0, idx)
-            valid_mask = mech_b >= 0.0
-            if torch.any(valid_mask):
-                loss_mech = soft_binary_cross_entropy(mech_prob[valid_mask], mech_b[valid_mask]) * float(lambda_mech)
+            if mtl_enabled:
+                # 机制分类软标签损失（仅对有效标签计算）
+                mech_b = mech_tr.index_select(0, idx)
+                valid_mask = mech_b >= 0.0
+                if torch.any(valid_mask):
+                    loss_mech = soft_binary_cross_entropy(mech_prob[valid_mask], mech_b[valid_mask]) * float(lambda_mech)
+                else:
+                    loss_mech = torch.tensor(0.0, device=device)
+                loss = loss_mse + loss_phys_low + loss_phys_high + loss_fs_val + loss_mech
             else:
-                loss_mech = torch.tensor(0.0, device=device)
-
-            loss = loss_mse + loss_phys_low + loss_phys_high + loss_fs_val + loss_mech
+                loss = loss_mse + loss_phys_low + loss_phys_high + loss_fs_val
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -436,6 +447,7 @@ def run_material_split(
     test_ratio: float,
     seed: int,
     device: torch.device,
+    mtl_enabled: bool,
 ):
     print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，Train/Test 分色)')
     dataset = build_dataset(material, include_fp=include_fp)
@@ -480,6 +492,7 @@ def run_material_split(
         material_name=material,
         device=device,
         grad_clip_norm=1.0,
+        mtl_enabled=mtl_enabled,
     )
 
     # 预测（输出 cycles 与机制概率）
@@ -506,6 +519,7 @@ def run_material_loo(
     lambda_mech: float,
     seed: int,
     device: torch.device,
+    mtl_enabled: bool,
 ):
     print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，LOO)')
     dataset = build_dataset(material, include_fp=include_fp)
@@ -553,6 +567,7 @@ def run_material_loo(
             material_name=material,
             device=device,
             grad_clip_norm=1.0,
+            mtl_enabled=mtl_enabled,
         )
         Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device)
         Np_pred_all[i] = float(Np_pred_i[0])
@@ -590,6 +605,7 @@ def main():
     parser.add_argument('--lambda-upper', type=float, default=0.1, help='上界约束权重')
     parser.add_argument('--lambda-fs', type=float, default=0.1, help='FS 物理损失权重')
     parser.add_argument('--lambda-mech', type=float, default=0.3, help='机制分类软标签损失权重')
+    parser.add_argument('--no-mtl', action='store_true', help='关闭多任务（仅寿命预测）')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
 
     args = parser.parse_args()
@@ -599,6 +615,7 @@ def main():
     hidden_dims = parse_hidden_dims(args.hidden_dims)
 
     include_fp = (not args.no_fp)
+    mtl_enabled = (not args.no_mtl)
 
     if args.material == 'ALL':
         materials = get_available_materials()
@@ -623,6 +640,7 @@ def main():
                         lambda_upper=float(args.lambda_upper),
                         lambda_fs=float(args.lambda_fs),
                         lambda_mech=float(args.lambda_mech),
+                        mtl_enabled=mtl_enabled,
                         seed=int(args.seed),
                         device=dev,
                     )
@@ -641,6 +659,7 @@ def main():
                         lambda_upper=float(args.lambda_upper),
                         lambda_fs=float(args.lambda_fs),
                         lambda_mech=float(args.lambda_mech),
+                        mtl_enabled=mtl_enabled,
                         test_ratio=float(args.test_ratio),
                         seed=int(args.seed),
                         device=dev,
@@ -663,6 +682,7 @@ def main():
                 lambda_upper=float(args.lambda_upper),
                 lambda_fs=float(args.lambda_fs),
                 lambda_mech=float(args.lambda_mech),
+                mtl_enabled=mtl_enabled,
                 seed=int(args.seed),
                 device=dev,
             )
@@ -681,6 +701,7 @@ def main():
                 lambda_upper=float(args.lambda_upper),
                 lambda_fs=float(args.lambda_fs),
                 lambda_mech=float(args.lambda_mech),
+                mtl_enabled=mtl_enabled,
                 test_ratio=float(args.test_ratio),
                 seed=int(args.seed),
                 device=dev,
