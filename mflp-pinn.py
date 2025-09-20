@@ -1,4 +1,6 @@
 import os
+
+import argparse
 import sys
 import math
 import numpy as np
@@ -785,6 +787,76 @@ def plot_loss_history(material: str, history: dict):
     print(f'训练/验证损失曲线已保存: {plot_path}')
 
 
+def _compute_binary_metrics(y_true_soft: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
+    """针对机制预测的软标签计算主要二分类指标。"""
+    mask = y_true_soft >= 0.0
+    valid_scores = y_score[mask]
+    valid_labels = y_true_soft[mask]
+    support = int(valid_labels.size)
+    if support == 0:
+        return {'auc': float('nan'), 'accuracy': float('nan'), 'support': 0}
+
+    y_true = (valid_labels >= 0.5).astype(np.int32)
+    y_pred = (valid_scores >= 0.5).astype(np.int32)
+    accuracy = float(np.mean(y_pred == y_true)) if support > 0 else float('nan')
+
+    pos = int(y_true.sum())
+    neg = support - pos
+    if pos == 0 or neg == 0:
+        auc = float('nan')
+    else:
+        # 以秩统计计算 ROC AUC，避免依赖外部库
+        order = np.argsort(valid_scores)
+        ranks = np.empty_like(order, dtype=np.float64)
+        ranks[order] = np.arange(1, support + 1)
+        sum_ranks_pos = float(np.sum(ranks[y_true == 1]))
+        auc = (sum_ranks_pos - pos * (pos + 1) / 2.0) / (pos * neg)
+
+    return {'auc': auc, 'accuracy': accuracy, 'support': support}
+
+
+def plot_mechanism_metrics(material: str, metrics_by_split: dict[str, dict[str, float]], mode: str):
+    """绘制机制预测的 AUC 与准确率条形图。"""
+    if not metrics_by_split:
+        return
+
+    splits = list(metrics_by_split.keys())
+    metrics_names = ['auc', 'accuracy']
+    colors = ['#1f77b4', '#d62728', '#2ca02c', '#ff7f0e']
+
+    fig, axes = plt.subplots(1, len(metrics_names), figsize=(12, 5))
+    axes = np.atleast_1d(axes)
+    for ax, metric in zip(axes, metrics_names):
+        values = [metrics_by_split[split].get(metric, float('nan')) for split in splits]
+        finite_vals = [v for v in values if np.isfinite(v)]
+        positions = np.arange(len(splits), dtype=np.float64)
+        bars = ax.bar(
+            positions,
+            [v if np.isfinite(v) else 0.0 for v in values],
+            color=[colors[i % len(colors)] for i in range(len(splits))],
+            alpha=0.85,
+        )
+        for bar, v in zip(bars, values):
+            x = bar.get_x() + bar.get_width() / 2.0
+            if np.isfinite(v):
+                ax.text(x, v + 0.02, f'{v:.3f}', ha='center', va='bottom', fontsize=10)
+            else:
+                ax.text(x, 0.02, 'N/A', ha='center', va='bottom', fontsize=10)
+        ax.set_ylim(0.0, min(1.05, max(1.0, max(finite_vals, default=1.0) + 0.05)))
+        ax.set_ylabel(metric.upper())
+        ax.set_xticks(positions)
+        ax.set_xticklabels(splits, rotation=20)
+        ax.set_title(f'{metric.upper()}')
+        ax.grid(True, axis='y', alpha=0.3)
+
+    fig.suptitle(f'{material} Mechanism Prediction Metrics ({mode})')
+    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+    plot_path = get_output_path(material, f'{material}_mechanism_metrics_{mode}.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f'机制预测指标图已保存: {plot_path}')
+
+
 def evaluate_and_save_split(
     material: str,
     dataset: dict,
@@ -794,6 +866,9 @@ def evaluate_and_save_split(
     Np_te: np.ndarray,
     Mech_tr: np.ndarray,
     Mech_te: np.ndarray,
+    mech_labels_train: np.ndarray,
+    mech_labels_test: np.ndarray,
+    mtl_enabled: bool,
 ):
     meta = dataset['meta']
 
@@ -875,12 +950,36 @@ def evaluate_and_save_split(
     plt.close()
     print(f'分色散点图已保存: {plot_path}')
 
+    if mtl_enabled:
+        train_metrics = _compute_binary_metrics(np.asarray(mech_labels_train, dtype=np.float64), np.asarray(Mech_tr, dtype=np.float64))
+        test_metrics = _compute_binary_metrics(np.asarray(mech_labels_test, dtype=np.float64), np.asarray(Mech_te, dtype=np.float64))
+
+        train_auc = f"{train_metrics['auc']:.3f}" if np.isfinite(train_metrics['auc']) else 'NA'
+        train_acc = f"{train_metrics['accuracy']:.3f}" if np.isfinite(train_metrics['accuracy']) else 'NA'
+        test_auc = f"{test_metrics['auc']:.3f}" if np.isfinite(test_metrics['auc']) else 'NA'
+        test_acc = f"{test_metrics['accuracy']:.3f}" if np.isfinite(test_metrics['accuracy']) else 'NA'
+
+        print(f"机制预测-训练集: 样本={train_metrics['support']}, AUC={train_auc}, 准确率={train_acc}")
+        print(f"机制预测-测试集: 样本={test_metrics['support']}, AUC={test_auc}, 准确率={test_acc}")
+
+        if (train_metrics['support'] > 0) or (test_metrics['support'] > 0):
+            plot_mechanism_metrics(
+                material,
+                {
+                    'Train': train_metrics,
+                    'Test': test_metrics,
+                },
+                mode='split',
+            )
+
 
 def evaluate_and_save_loo(
     material: str,
     dataset: dict,
     Np_pred_all: np.ndarray,
     Mech_prob_all: np.ndarray,
+    mech_labels_all: np.ndarray,
+    mtl_enabled: bool,
 ):
     meta = dataset['meta']
     Nf_true = np.array([m['Nf'] for m in meta], dtype=np.float64)
@@ -935,6 +1034,22 @@ def evaluate_and_save_loo(
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f'散点图已保存: {plot_path}')
+
+    if mtl_enabled:
+        all_metrics = _compute_binary_metrics(np.asarray(mech_labels_all, dtype=np.float64), np.asarray(Mech_prob_all, dtype=np.float64))
+        if all_metrics['support'] > 0:
+            auc_info = f"{all_metrics['auc']:.3f}" if np.isfinite(all_metrics['auc']) else 'NA'
+            acc_info = f"{all_metrics['accuracy']:.3f}" if np.isfinite(all_metrics['accuracy']) else 'NA'
+            print(f"机制预测-整体: 样本={all_metrics['support']}, AUC={auc_info}, 准确率={acc_info}")
+            plot_mechanism_metrics(
+                material,
+                {
+                    'All': all_metrics,
+                },
+                mode='loo',
+            )
+        else:
+            print('机制预测-整体: 无可用软标签，跳过 AUC/准确率评估')
 
 
 def run_material_split(
@@ -1002,7 +1117,7 @@ def run_material_split(
         device=device,
         grad_clip_norm=1.0,
         mtl_enabled=mtl_enabled,
-            backbone=backbone,
+        backbone=backbone,
         # 验证集（用于绘制曲线）
         X_val=Xz[test_idx],
         y_val_log10=y_log[test_idx],
@@ -1014,7 +1129,19 @@ def run_material_split(
     Np_tr, Mech_tr = predict_outputs(model, Xz[train_idx], device=device)
     Np_te, Mech_te = predict_outputs(model, Xz[test_idx], device=device)
 
-    evaluate_and_save_split(material, dataset, train_idx, test_idx, Np_tr, Np_te, Mech_tr, Mech_te)
+    evaluate_and_save_split(
+        material,
+        dataset,
+        train_idx,
+        test_idx,
+        Np_tr,
+        Np_te,
+        Mech_tr,
+        Mech_te,
+        mech_all[train_idx],
+        mech_all[test_idx],
+        mtl_enabled,
+    )
     # 绘制并保存 loss 曲线
     plot_loss_history(material, history)
 
@@ -1094,7 +1221,14 @@ def run_material_loo(
         if (count + 1) % max(1, n // 10) == 0:
             print(f'LOO 进度: {count + 1}/{n}')
 
-    evaluate_and_save_loo(material, dataset, Np_pred_all, Mech_prob_all)
+    evaluate_and_save_loo(
+        material,
+        dataset,
+        Np_pred_all,
+        Mech_prob_all,
+        mech_all,
+        mtl_enabled,
+    )
 
 
 def parse_hidden_dims(text: str) -> list[int]:
@@ -1103,34 +1237,7 @@ def parse_hidden_dims(text: str) -> list[int]:
     return [int(x) for x in text.split(',') if x.strip()]
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='MFLP-PINN：基于物理约束的多轴疲劳寿命预测（时间序列特征）')
-    parser.add_argument('--material', type=str, default='ALL', choices=['ALL'] + list(DATA_DIRS.keys()))
-    parser.add_argument('--no-fp', action='store_true', help='不使用疲劳参数 FP 作为特征')
-    parser.add_argument('--method', type=str, default='split', choices=['split', 'loo'], help='预测方式：split 或 loo')
-    parser.add_argument('--test-ratio', type=float, default=0.2, help='测试集比例（split 模式）')
-    parser.add_argument('--seed', type=int, default=42, help='随机种子')
-
-    # 模型/训练参数
-    parser.add_argument('--hidden-dims', type=str, default='128,64', help='隐藏层维度，例如 128,64')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout 比例')
-    parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
-    parser.add_argument('--weight-decay', type=float, default=1e-4, help='权重衰减')
-    parser.add_argument('--epochs', type=int, default=1500, help='训练轮数')
-    parser.add_argument('--batch-size', type=int, default=32, help='批大小')
-    parser.add_argument('--upper-cycles', type=float, default=1e7, help='疲劳寿命上限（物理约束）')
-    parser.add_argument('--lambda-nonneg', type=float, default=1.0, help='非负约束权重')
-    parser.add_argument('--lambda-upper', type=float, default=0.1, help='上界约束权重')
-    parser.add_argument('--lambda-fs', type=float, default=0.1, help='FS 物理损失权重')
-    parser.add_argument('--lambda-mech', type=float, default=0.3, help='机制分类软标签损失权重')
-    parser.add_argument('--no-mtl', action='store_true', help='关闭多任务（仅寿命预测）')
-    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
-    parser.add_argument('--backbone', type=str, default='transformer', choices=['mlp', 'transformer'], help='选择回骨网络：mlp 或 transformer')
-
-    args = parser.parse_args(
-        ["--epochs", "100"]
-    )
+def main(args):
 
     seed_everything(int(args.seed))
     dev = torch.device('cuda' if (args.device == 'cuda' or (args.device == 'auto' and torch.cuda.is_available())) else 'cpu')
@@ -1234,7 +1341,42 @@ def main():
                 backbone=backbone,
             )
 
+parser = argparse.ArgumentParser(description='MFLP-PINN：基于物理约束的多轴疲劳寿命预测（时间序列特征）')
+parser.add_argument('--material', type=str, default='ALL', choices=['ALL'] + list(DATA_DIRS.keys()))
+parser.add_argument('--no-fp', action='store_true', help='不使用疲劳参数 FP 作为特征')
+parser.add_argument('--method', type=str, default='split', choices=['split', 'loo'], help='预测方式：split 或 loo')
+parser.add_argument('--test-ratio', type=float, default=0.2, help='测试集比例（split 模式）')
+parser.add_argument('--seed', type=int, default=42, help='随机种子')
 
-main()
+# 模型/训练参数
+parser.add_argument('--hidden-dims', type=str, default='128,64', help='隐藏层维度，例如 128,64')
+parser.add_argument('--dropout', type=float, default=0.1, help='Dropout 比例')
+parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
+parser.add_argument('--weight-decay', type=float, default=1e-4, help='权重衰减')
+parser.add_argument('--epochs', type=int, default=1500, help='训练轮数')
+parser.add_argument('--batch-size', type=int, default=32, help='批大小')
+parser.add_argument('--upper-cycles', type=float, default=1e7, help='疲劳寿命上限（物理约束）')
+parser.add_argument('--lambda-nonneg', type=float, default=1.0, help='非负约束权重')
+parser.add_argument('--lambda-upper', type=float, default=0.1, help='上界约束权重')
+parser.add_argument('--lambda-fs', type=float, default=0.1, help='FS 物理损失权重')
+parser.add_argument('--lambda-mech', type=float, default=0.3, help='机制分类软标签损失权重')
+parser.add_argument('--no-mtl', action='store_true', help='关闭多任务（仅寿命预测）')
+parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
+parser.add_argument('--backbone', type=str, default='transformer', choices=['mlp', 'transformer'], help='选择回骨网络：mlp 或 transformer')
 
+# 你运行哪个就保留哪个args，删掉其他两个
+# mlp
+args = parser.parse_args(
+    ["--epochs", "100", "--backbone", "mlp"]
+)
 
+# transformers
+args = parser.parse_args(
+    ["--epochs", "100", "--backbone", "transformer", "--no-mtl"]
+)
+
+# transformers + 多任务学习
+args = parser.parse_args(
+    ["--epochs", "100", "--backbone", "transformer"]
+)
+main(args)
