@@ -1367,16 +1367,16 @@ parser.add_argument('--backbone', type=str, default='transformer', choices=['mlp
 # 你运行哪个就保留哪个args，删掉其他两个
 # mlp
 args = parser.parse_args(
-    ["--epochs", "100", "--backbone", "mlp"]
+    ["--epochs", "100", "--backbone", "mlp", "--no-mtl", "--loo"]
 )
 
 # transformers
 args = parser.parse_args(
-    ["--epochs", "100", "--backbone", "transformer", "--no-mtl"]
+    ["--epochs", "100", "--backbone", "transformer", "--no-mtl", "--loo"]
 )
 
 # transformers + 多任务学习
 args = parser.parse_args(
-    ["--epochs", "100", "--backbone", "transformer"]
+    ["--epochs", "100", "--backbone", "transformer", "--loo"]
 )
 main(args)
