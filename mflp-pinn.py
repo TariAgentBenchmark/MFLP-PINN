@@ -103,16 +103,27 @@ def read_strain_series(file_path: str):
 
 def read_fatigue_data(file_path: str):
     excel = pd.ExcelFile(file_path)
-    epsilon_a, gamma_a, Nf, FP = [], [], [], []
+    epsilon_a, gamma_a, Nf, FP, groups = [], [], [], [], []
     for sheet in excel.sheet_names:
         df = pd.read_excel(file_path, sheet_name=sheet)
         if df.shape[1] < 6:
             continue
-        epsilon_a.extend(df.iloc[:, 0].to_numpy())
-        gamma_a.extend(df.iloc[:, 1].to_numpy())
-        Nf.extend(df.iloc[:, 2].to_numpy())
-        FP.extend(df.iloc[:, 5].to_numpy())
-    return np.array(epsilon_a, dtype=np.float64), np.array(gamma_a, dtype=np.float64), np.array(Nf, dtype=np.float64), np.array(FP, dtype=np.float64)
+        eps = df.iloc[:, 0].to_numpy()
+        gam = df.iloc[:, 1].to_numpy()
+        nf = df.iloc[:, 2].to_numpy()
+        fp = df.iloc[:, 5].to_numpy()
+        epsilon_a.extend(eps)
+        gamma_a.extend(gam)
+        Nf.extend(nf)
+        FP.extend(fp)
+        groups.extend([str(sheet)] * len(eps))
+    return (
+        np.array(epsilon_a, dtype=np.float64),
+        np.array(gamma_a, dtype=np.float64),
+        np.array(Nf, dtype=np.float64),
+        np.array(FP, dtype=np.float64),
+        np.array(groups, dtype=object),
+    )
 
 
 # 特征工程
@@ -241,7 +252,7 @@ def build_dataset(material_name: str, include_fp: bool = True):
         feature_map[key] = feats
         file_map[key] = fname
 
-    eps_all, gam_all, Nf_all, FP_all = read_fatigue_data(fatigue_path)
+    eps_all, gam_all, Nf_all, FP_all, grp_all = read_fatigue_data(fatigue_path)
 
     X_list, y_list = [], []
     meta = []
@@ -262,7 +273,8 @@ def build_dataset(material_name: str, include_fp: bool = True):
             'epsilon_a': float(eps_all[i]),
             'gamma_a': float(gam_all[i]),
             'FP': float(FP_all[i]),
-            'Nf': float(Nf_all[i])
+            'Nf': float(Nf_all[i]),
+            'group': str(grp_all[i])
         })
 
     if len(X_list) == 0:
@@ -1185,41 +1197,81 @@ def run_material_loo(
     Np_pred_all = np.zeros(n, dtype=np.float64)
     Mech_prob_all = np.zeros(n, dtype=np.float64)
 
-    rng = np.random.RandomState(int(seed))
-    order = np.arange(n)
-    rng.shuffle(order)
+    # 基于工况（Excel 工作表名）进行分组 LOO。如果仅有一个工况，则退化为样本级 LOO。
+    groups_list = np.array([m.get('group', 'Unknown') for m in dataset['meta']], dtype=object)
+    unique_groups: list[str] = []
+    for g in groups_list:
+        if g not in unique_groups:
+            unique_groups.append(g)
 
-    # 为了效率，LOO 每次重新初始化并短训练
-    for count, i in enumerate(order):
-        mask = np.ones(n, dtype=bool)
-        mask[i] = False
-        model, _ = train_mflp_pinn(
-            X_train=Xz[mask],
-            y_train_log10=y_log[mask],
-            hidden_dims=hidden_dims,
-            dropout=dropout,
-            lr=lr,
-            weight_decay=weight_decay,
-            epochs=epochs,
-            batch_size=batch_size,
-            upper_cycle_limit=upper_cycle_limit,
-            lambda_nonneg=lambda_nonneg,
-            lambda_upper=lambda_upper,
-            lambda_fs=lambda_fs,
-            lambda_mech=lambda_mech,
-            fp_train=fp_all[mask],
-            mech_labels_train=mech_all[mask],
-            material_name=material,
-            device=device,
-            grad_clip_norm=1.0,
-            mtl_enabled=mtl_enabled,
-            backbone=backbone,
-        )
-        Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device)
-        Np_pred_all[i] = float(Np_pred_i[0])
-        Mech_prob_all[i] = float(Mech_prob_i[0])
-        if (count + 1) % max(1, n // 10) == 0:
-            print(f'LOO 进度: {count + 1}/{n}')
+    if len(unique_groups) > 1:
+        print(f"检测到工况组: {', '.join(map(str, unique_groups))}")
+        for gi, gname in enumerate(unique_groups):
+            test_mask = (groups_list == gname)
+            train_mask = ~test_mask
+            if not np.any(test_mask):
+                continue
+            model, _ = train_mflp_pinn(
+                X_train=Xz[train_mask],
+                y_train_log10=y_log[train_mask],
+                hidden_dims=hidden_dims,
+                dropout=dropout,
+                lr=lr,
+                weight_decay=weight_decay,
+                epochs=epochs,
+                batch_size=batch_size,
+                upper_cycle_limit=upper_cycle_limit,
+                lambda_nonneg=lambda_nonneg,
+                lambda_upper=lambda_upper,
+                lambda_fs=lambda_fs,
+                lambda_mech=lambda_mech,
+                fp_train=fp_all[train_mask],
+                mech_labels_train=mech_all[train_mask],
+                material_name=material,
+                device=device,
+                grad_clip_norm=1.0,
+                mtl_enabled=mtl_enabled,
+                backbone=backbone,
+            )
+            Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[test_mask], device=device)
+            Np_pred_all[test_mask] = Np_pred_i.reshape(-1)
+            Mech_prob_all[test_mask] = Mech_prob_i.reshape(-1)
+            print(f"LOO(工况) 进度: {gi + 1}/{len(unique_groups)} - 留出: {gname}, 测试样本: {int(test_mask.sum())}")
+    else:
+        rng = np.random.RandomState(int(seed))
+        order = np.arange(n)
+        rng.shuffle(order)
+        # 样本级 LOO
+        for count, i in enumerate(order):
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+            model, _ = train_mflp_pinn(
+                X_train=Xz[mask],
+                y_train_log10=y_log[mask],
+                hidden_dims=hidden_dims,
+                dropout=dropout,
+                lr=lr,
+                weight_decay=weight_decay,
+                epochs=epochs,
+                batch_size=batch_size,
+                upper_cycle_limit=upper_cycle_limit,
+                lambda_nonneg=lambda_nonneg,
+                lambda_upper=lambda_upper,
+                lambda_fs=lambda_fs,
+                lambda_mech=lambda_mech,
+                fp_train=fp_all[mask],
+                mech_labels_train=mech_all[mask],
+                material_name=material,
+                device=device,
+                grad_clip_norm=1.0,
+                mtl_enabled=mtl_enabled,
+                backbone=backbone,
+            )
+            Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device)
+            Np_pred_all[i] = float(Np_pred_i[0])
+            Mech_prob_all[i] = float(Mech_prob_i[0])
+            if (count + 1) % max(1, n // 10) == 0:
+                print(f'LOO 进度: {count + 1}/{n}')
 
     evaluate_and_save_loo(
         material,
