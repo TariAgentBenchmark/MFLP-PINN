@@ -902,6 +902,7 @@ def evaluate_and_save_split(
         rows.append({
             'set': 'train',
             'file': m['file'],
+            'group': m.get('group', ''),
             'epsilon_a': m['epsilon_a'],
             'gamma_a': m['gamma_a'],
             'FP': m['FP'],
@@ -917,6 +918,7 @@ def evaluate_and_save_split(
         rows.append({
             'set': 'test',
             'file': m['file'],
+            'group': m.get('group', ''),
             'epsilon_a': m['epsilon_a'],
             'gamma_a': m['gamma_a'],
             'FP': m['FP'],
@@ -934,12 +936,48 @@ def evaluate_and_save_split(
     df_out.to_csv(csv_path, index=False)
     print(f'分割结果已保存: {csv_path}')
 
-    # 绘图（训练/测试分色）
+    # 绘图（按工况分色 + 训练/测试用不同标记）
     plt.figure(figsize=(8, 8))
-    plt.scatter(Nf_tr, Np_tr, alpha=0.75, label='Train', c='#1f77b4', s=60)
-    plt.scatter(Nf_te, Np_te, alpha=0.95, label='Test', c='#d62728', s=120, edgecolors='k', linewidths=0.5, zorder=3)
+    groups_all = np.array([m.get('group', 'Unknown') for m in meta], dtype=object)
+    unique_groups = []
+    for g in groups_all:
+        if g not in unique_groups:
+            unique_groups.append(g)
+    cmap = plt.get_cmap('tab20')
+    color_map = {g: cmap(i % 20) for i, g in enumerate(unique_groups)}
+
+    # 计算绘制辅助范围
     mn = min(float(np.min(np.concatenate([Nf_tr, Nf_te]))), float(np.min(np.concatenate([Np_tr, Np_te]))))
     mx = max(float(np.max(np.concatenate([Nf_tr, Nf_te]))), float(np.max(np.concatenate([Np_tr, Np_te]))))
+
+    grp_tr = groups_all[train_idx]
+    grp_te = groups_all[test_idx]
+    for g in unique_groups:
+        mtr = (grp_tr == g)
+        if np.any(mtr):
+            plt.scatter(
+                Nf_tr[mtr],
+                Np_tr[mtr],
+                alpha=0.8,
+                label=f'{g}-Train',
+                c=[color_map[g]],
+                s=60,
+            )
+        mte = (grp_te == g)
+        if np.any(mte):
+            plt.scatter(
+                Nf_te[mte],
+                Np_te[mte],
+                alpha=0.95,
+                label=f'{g}-Test',
+                c=[color_map[g]],
+                s=110,
+                marker='^',
+                edgecolors='k',
+                linewidths=0.5,
+                zorder=3,
+            )
+
     plt.plot([mn, mx], [mn, mx], color='#d62728', linestyle='--', linewidth=1.8, label='Perfect')
     # Factor of 1.5 (green dashdot)
     plt.plot([mn, mx], [mn / 1.5, mx / 1.5], color='#2ca02c', linestyle='-.', linewidth=2.0, label='Factor of 1.5')
@@ -955,7 +993,7 @@ def evaluate_and_save_split(
     plt.xlabel('True Life (Nf)')
     plt.ylabel('Predicted Life (Np)')
     plt.title(f'{material} MFLP-PINN Predictions (Train/Test)')
-    plt.legend()
+    plt.legend(ncol=2)
     plt.grid(True)
     plot_path = get_output_path(material, f'{material}_mflp_pinn_scatter_split.png')
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
@@ -1004,6 +1042,7 @@ def evaluate_and_save_loo(
     for i, m in enumerate(meta):
         rows.append({
             'file': m['file'],
+            'group': m.get('group', ''),
             'epsilon_a': m['epsilon_a'],
             'gamma_a': m['gamma_a'],
             'FP': m['FP'],
@@ -1020,9 +1059,26 @@ def evaluate_and_save_loo(
     df_out.to_csv(csv_path, index=False)
     print(f'结果已保存: {csv_path}')
 
-    # 绘图
+    # 绘图（按工况分色）
     plt.figure(figsize=(8, 8))
-    plt.scatter(Nf_true, Np_pred_all, alpha=0.7, label='Predicted')
+    groups_all = np.array([m.get('group', 'Unknown') for m in meta], dtype=object)
+    unique_groups = []
+    for g in groups_all:
+        if g not in unique_groups:
+            unique_groups.append(g)
+    cmap = plt.get_cmap('tab20')
+    color_map = {g: cmap(i % 20) for i, g in enumerate(unique_groups)}
+    for g in unique_groups:
+        mask = (groups_all == g)
+        if np.any(mask):
+            plt.scatter(
+                Nf_true[mask],
+                Np_pred_all[mask],
+                alpha=0.85,
+                label=g,
+                c=[color_map[g]],
+                s=80,
+            )
     mn = min(float(np.min(Nf_true)), float(np.min(Np_pred_all)))
     mx = max(float(np.max(Nf_true)), float(np.max(Np_pred_all)))
     plt.plot([mn, mx], [mn, mx], color='#d62728', linestyle='--', linewidth=1.8, label='Perfect')
@@ -1040,7 +1096,7 @@ def evaluate_and_save_loo(
     plt.xlabel('True Life (Nf)')
     plt.ylabel('Predicted Life (Np)')
     plt.title(f'{material} MFLP-PINN Predictions (LOO)')
-    plt.legend()
+    plt.legend(ncol=2)
     plt.grid(True)
     plot_path = get_output_path(material, f'{material}_mflp_pinn_scatter_loo.png')
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
