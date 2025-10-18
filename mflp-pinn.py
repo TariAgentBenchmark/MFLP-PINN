@@ -44,6 +44,30 @@ DATA_DIRS = {
     'Q235B2': {
         'strain_series': 'data/Q235B焊接金属应变时间序列数据',
         'fatigue_data': 'data/多轴疲劳试验数据/Q235B2.xls'
+    },
+    'AZ61A': {
+        'strain_series': 'new_data/AZ61A应变时间序列数据',
+        'fatigue_data': 'new_data/多轴疲劳试验数据/AZ61A镁合金多轴疲劳试验数据.xls'
+    },
+    'E235': {
+        'strain_series': 'new_data/E235应变时间序列数据',
+        'fatigue_data': 'new_data/多轴疲劳试验数据/E235多轴疲劳试验数据.xls'
+    },
+    'E355': {
+        'strain_series': 'new_data/E355应变时间序列数据',
+        'fatigue_data': 'new_data/多轴疲劳试验数据/E355多轴疲劳试验数据.xls'
+    },
+    'PA38-T6': {
+        'strain_series': 'new_data/PA38-T6应变时间序列数据',
+        'fatigue_data': 'new_data/多轴疲劳试验数据/PA38-T6多轴疲劳试验数据.xls'
+    },
+    'SA333 Gr.6': {
+        'strain_series': 'new_data/SA333 Gr.6应变时间序列数据',
+        'fatigue_data': 'new_data/多轴疲劳试验数据/SA333 Gr.6多轴疲劳试验数据.xls'
+    },
+    'X5CrNi18-10': {
+        'strain_series': 'new_data/X5CrNi18-10应变时间序列数据',
+        'fatigue_data': 'new_data/多轴疲劳试验数据/X5CrNi18-10多轴疲劳试验数据.xls'
     }
 }
 
@@ -65,8 +89,19 @@ def get_output_path(material_name: str, file_name: str) -> str:
 
 
 def parse_strain_values_from_filename(filename: str):
-    parts = filename.replace('strain_series_', '').replace('.xls', '').replace('.csv', '').split('_')
-    return float(parts[0]), float(parts[1])
+    base = filename.replace('strain_series_', '').replace('.xls', '').replace('.csv', '')
+    base = base.replace('(', '_').replace(')', '').replace(' ', '')
+    parts = [p for p in base.split('_') if p != '']
+    if len(parts) < 2:
+        raise ValueError(f'文件名无法解析应变幅值: {filename}')
+    def _sanitize(val: str) -> float:
+        # 保留数字、符号与小数点
+        cleaned = ''.join(ch for ch in val if ch.isdigit() or ch in {'.', '+', '-', 'e', 'E'})
+        if cleaned == '' or cleaned in {'-', '+', '.', 'e', 'E'}:
+            raise ValueError(f'无法从文件名解析浮点数: {filename}')
+        return float(cleaned)
+
+    return _sanitize(parts[0]), _sanitize(parts[1])
 
 
 def read_strain_series(file_path: str):
@@ -180,6 +215,20 @@ def _corrcoef(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def _resample_time_series(time: np.ndarray, values: np.ndarray, seq_len: int) -> np.ndarray:
+    if time.size == 0 or values.size == 0:
+        return np.zeros(seq_len, dtype=np.float64)
+    t0 = float(time[0])
+    t1 = float(time[-1])
+    if t1 == t0:
+        base = np.linspace(0.0, 1.0, num=time.size, dtype=np.float64)
+    else:
+        base = (time - t0) / (t1 - t0)
+    target = np.linspace(0.0, 1.0, num=seq_len, dtype=np.float64)
+    resampled = np.interp(target, base, values, left=values[0], right=values[-1])
+    return resampled.astype(np.float64)
+
+
 def _fft_features(time: np.ndarray, x: np.ndarray):
     n = x.size
     if n < 8:
@@ -230,7 +279,13 @@ def compute_features(time: np.ndarray, normal: np.ndarray, shear: np.ndarray) ->
 
 
 # 构建数据集（按材料）
-def build_dataset(material_name: str, include_fp: bool = True):
+def build_dataset(
+    material_name: str,
+    include_fp: bool = True,
+    *,
+    use_raw_sequence: bool = False,
+    raw_seq_len: int = 512,
+):
     strain_dir = get_strain_series_path(material_name)
     fatigue_path = get_fatigue_data_path(material_name)
     if not os.path.exists(strain_dir):
@@ -248,8 +303,15 @@ def build_dataset(material_name: str, include_fp: bool = True):
         key = (round(float(ea), 5), round(float(ga), 5))
         path = os.path.join(strain_dir, fname)
         time, normal, shear = read_strain_series(path)
-        feats = compute_features(time, normal, shear)
-        feature_map[key] = feats
+        if use_raw_sequence:
+            normal_rs = _resample_time_series(time, normal, raw_seq_len)
+            shear_rs = _resample_time_series(time, shear, raw_seq_len)
+            # (seq_len, channels)
+            stacked = np.stack([normal_rs, shear_rs], axis=1)
+            feature_map[key] = stacked
+        else:
+            feats = compute_features(time, normal, shear)
+            feature_map[key] = feats
         file_map[key] = fname
 
     eps_all, gam_all, Nf_all, FP_all, grp_all = read_fatigue_data(fatigue_path)
@@ -261,12 +323,15 @@ def build_dataset(material_name: str, include_fp: bool = True):
         if key not in feature_map:
             continue
         feats = feature_map[key]
-        # 将幅值与 FP 作为额外特征
-        extra = [float(eps_all[i]), float(gam_all[i])]
-        if include_fp:
-            extra.append(float(FP_all[i]))
-        x = np.concatenate([feats, np.array(extra, dtype=np.float64)])
-        X_list.append(x)
+        if use_raw_sequence:
+            X_list.append(feats)
+        else:
+            # 将幅值与 FP 作为额外特征
+            extra = [float(eps_all[i]), float(gam_all[i])]
+            if include_fp:
+                extra.append(float(FP_all[i]))
+            x = np.concatenate([feats, np.array(extra, dtype=np.float64)])
+            X_list.append(x)
         y_list.append(math.log10(float(Nf_all[i])))
         meta.append({
             'file': file_map.get(key, ''),
@@ -280,8 +345,26 @@ def build_dataset(material_name: str, include_fp: bool = True):
     if len(X_list) == 0:
         raise ValueError('没有任何匹配的数据对（时间序列 与 疲劳表格）')
 
-    X = np.vstack(X_list)
     y = np.array(y_list, dtype=np.float64)
+
+    if use_raw_sequence:
+        X = np.stack(X_list, axis=0)  # (n, seq_len, channels)
+        mu = X.mean(axis=0)
+        sigma = X.std(axis=0)
+        sigma = np.where(sigma > 0, sigma, 1.0)
+        return {
+            'Phi': None,
+            'X': X,
+            'y': y,
+            'mu': mu,
+            'sigma': sigma,
+            'meta': meta,
+            'input_channels': X.shape[-1],
+            'seq_len': X.shape[1],
+            'is_raw': True,
+        }
+
+    X = np.vstack(X_list)
 
     # 标准化（全局）
     mu = X.mean(axis=0)
@@ -297,7 +380,10 @@ def build_dataset(material_name: str, include_fp: bool = True):
         'y': y,
         'mu': mu,
         'sigma': sigma,
-        'meta': meta
+        'meta': meta,
+        'input_channels': 1,
+        'seq_len': X.shape[1],
+        'is_raw': False,
     }
 
 
@@ -375,6 +461,48 @@ materials_params = {
         'b0': -0.3555,
         'c0': -0.3181,
     },
+    'AZ61A': {
+        'G': 16.5,
+        'tau_f_G': 225.0,
+        'gamma_f': 0.15,
+        'b0': -0.09,
+        'c0': -0.57,
+    },
+    'E235': {
+        'G': 82.0,
+        'tau_f_G': 420.0,
+        'gamma_f': 0.48,
+        'b0': -0.08,
+        'c0': -0.62,
+    },
+    'E355': {
+        'G': 85.0,
+        'tau_f_G': 510.0,
+        'gamma_f': 0.52,
+        'b0': -0.08,
+        'c0': -0.65,
+    },
+    'PA38-T6': {
+        'G': 26.0,
+        'tau_f_G': 290.0,
+        'gamma_f': 0.41,
+        'b0': -0.10,
+        'c0': -0.62,
+    },
+    'SA333 Gr.6': {
+        'G': 80.0,
+        'tau_f_G': 390.0,
+        'gamma_f': 0.55,
+        'b0': -0.08,
+        'c0': -0.60,
+    },
+    'X5CrNi18-10': {
+        'G': 77.0,
+        'tau_f_G': 560.0,
+        'gamma_f': 0.43,
+        'b0': -0.09,
+        'c0': -0.61,
+    },
 }
 
 
@@ -439,13 +567,26 @@ def _build_sinusoidal_positional_encoding(seq_len: int, d_model: int, device: to
 
 
 class TransformerBackbone(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: list[int],
+        dropout: float,
+        *,
+        input_channels: int = 1,
+        use_raw_sequence: bool = False,
+        raw_seq_len: int | None = None,
+    ):
         super().__init__()
         d_model, num_layers, dim_feedforward = _resolve_transformer_dims(hidden_dims)
         nhead = _choose_transformer_heads(d_model)
         self.input_dim = int(input_dim)
+        self.input_channels = int(input_channels)
+        self.use_raw_sequence = bool(use_raw_sequence)
+        self.raw_seq_len = int(raw_seq_len) if raw_seq_len is not None else None
         self.d_model = int(d_model)
-        self.input_proj = nn.Linear(1, d_model)
+        in_features = self.input_channels if self.use_raw_sequence else 1
+        self.input_proj = nn.Linear(in_features, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -459,18 +600,30 @@ class TransformerBackbone(nn.Module):
         self.dropout = nn.Dropout(p=float(dropout)) if dropout > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, input_dim)
-        batch_size, feat_dim = x.shape
-        if feat_dim != self.input_dim:
-            # Guard against mismatch; truncate or pad with zeros to expected length (keeps interface robust)
-            if feat_dim > self.input_dim:
-                x = x[:, : self.input_dim]
-            else:
-                pad = torch.zeros(batch_size, self.input_dim - feat_dim, device=x.device, dtype=x.dtype)
-                x = torch.cat([x, pad], dim=1)
-        seq = x.unsqueeze(-1)  # (B, L, 1)
-        token = self.input_proj(seq)  # (B, L, d_model)
-        pe = _build_sinusoidal_positional_encoding(self.input_dim, self.d_model, token.device, token.dtype)
+        if self.use_raw_sequence:
+            # x: (batch, seq_len, channels)
+            batch_size, seq_len, channels = x.shape
+            if self.raw_seq_len is not None and seq_len != self.raw_seq_len:
+                if seq_len > self.raw_seq_len:
+                    x = x[:, : self.raw_seq_len, :]
+                else:
+                    pad = torch.zeros(batch_size, self.raw_seq_len - seq_len, channels, device=x.device, dtype=x.dtype)
+                    x = torch.cat([x, pad], dim=1)
+                seq_len = x.shape[1]
+        else:
+            # x: (batch, input_dim)
+            batch_size, feat_dim = x.shape
+            if feat_dim != self.input_dim:
+                if feat_dim > self.input_dim:
+                    x = x[:, : self.input_dim]
+                else:
+                    pad = torch.zeros(batch_size, self.input_dim - feat_dim, device=x.device, dtype=x.dtype)
+                    x = torch.cat([x, pad], dim=1)
+            x = x.unsqueeze(-1)
+            seq_len = self.input_dim
+
+        token = self.input_proj(x)  # (B, L, d_model)
+        pe = _build_sinusoidal_positional_encoding(seq_len, self.d_model, token.device, token.dtype)
         token = token + pe.unsqueeze(0)
         h = self.encoder(token)  # (B, L, d_model)
         h = self.dropout(h.mean(dim=1))  # mean-pool over feature positions -> (B, d_model)
@@ -478,9 +631,25 @@ class TransformerBackbone(nn.Module):
 
 
 class SmallTransformerRegressor(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: list[int],
+        dropout: float,
+        *,
+        input_channels: int = 1,
+        use_raw_sequence: bool = False,
+        raw_seq_len: int | None = None,
+    ):
         super().__init__()
-        self.backbone = TransformerBackbone(input_dim, hidden_dims, dropout)
+        self.backbone = TransformerBackbone(
+            input_dim,
+            hidden_dims,
+            dropout,
+            input_channels=input_channels,
+            use_raw_sequence=use_raw_sequence,
+            raw_seq_len=raw_seq_len,
+        )
         self.head = nn.Linear(self.backbone.d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -524,14 +693,31 @@ def build_mlp(input_dim: int, hidden_dims: list[int], dropout: float) -> nn.Sequ
 
 
 class MultiTaskMLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float, backbone: str = 'transformer'):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: list[int],
+        dropout: float,
+        backbone: str = 'transformer',
+        *,
+        input_channels: int = 1,
+        use_raw_sequence: bool = False,
+        raw_seq_len: int | None = None,
+    ):
         super().__init__()
         backbone = (backbone or 'transformer').lower()
         if backbone == 'mlp':
             bb = MLPBackbone(input_dim, hidden_dims, dropout)
             out_dim = bb.output_dim
         else:
-            bb = TransformerBackbone(input_dim, hidden_dims, dropout)
+            bb = TransformerBackbone(
+                input_dim,
+                hidden_dims,
+                dropout,
+                input_channels=input_channels,
+                use_raw_sequence=use_raw_sequence,
+                raw_seq_len=raw_seq_len,
+            )
             out_dim = bb.d_model
         self.backbone = bb
         self.life_head = nn.Linear(out_dim, 1)
@@ -571,6 +757,9 @@ def train_mflp_pinn(
     X_train: np.ndarray,
     y_train_log10: np.ndarray,
     *,
+    is_raw: bool,
+    input_channels: int,
+    seq_len: int,
     hidden_dims: list[int],
     dropout: float,
     lr: float,
@@ -589,23 +778,60 @@ def train_mflp_pinn(
     grad_clip_norm: float | None = None,
     mtl_enabled: bool = True,
     backbone: str = 'transformer',
-    # 可选验证集，用于绘制 loss 曲线
     X_val: np.ndarray | None = None,
     y_val_log10: np.ndarray | None = None,
     fp_val: np.ndarray | None = None,
     mech_labels_val: np.ndarray | None = None,
 ):
     model: nn.Module
+    transformer_kwargs: dict[str, int | bool | None] = {}
+    if is_raw:
+        transformer_kwargs = {
+            'input_channels': int(input_channels),
+            'use_raw_sequence': True,
+            'raw_seq_len': int(seq_len),
+        }
+
+    model_input_dim = X_train.shape[1] if not is_raw else X_train.shape[1]
     if mtl_enabled:
-        model = MultiTaskMLP(X_train.shape[1], hidden_dims, dropout, backbone=backbone).to(device)
+        model = MultiTaskMLP(
+            model_input_dim,
+            hidden_dims,
+            dropout,
+            backbone=backbone,
+            input_channels=int(transformer_kwargs.get('input_channels', 1)),
+            use_raw_sequence=bool(transformer_kwargs.get('use_raw_sequence', False)),
+            raw_seq_len=transformer_kwargs.get('raw_seq_len'),
+        ).to(device)
     else:
         if (backbone or 'transformer').lower() == 'mlp':
-            model = build_mlp(X_train.shape[1], hidden_dims, dropout).to(device)
+            if is_raw:
+                raise ValueError('Raw sequence mode requires transformer backbone')
+            model = build_mlp(model_input_dim, hidden_dims, dropout).to(device)
         else:
-            model = SmallTransformerRegressor(X_train.shape[1], hidden_dims, dropout).to(device)
+            model = SmallTransformerRegressor(
+                model_input_dim,
+                hidden_dims,
+                dropout,
+                input_channels=int(transformer_kwargs.get('input_channels', 1)),
+                use_raw_sequence=bool(transformer_kwargs.get('use_raw_sequence', False)),
+                raw_seq_len=transformer_kwargs.get('raw_seq_len'),
+            ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
+    raw_norm = None
+    if is_raw:
+        mu = X_train.mean(axis=0)
+        sigma = X_train.std(axis=0)
+        sigma = np.where(sigma > 0, sigma, 1.0)
+        X_train = (X_train - mu) / sigma
+        if X_val is not None:
+            X_val = (X_val - mu) / sigma
+        raw_norm = (mu, sigma)
+
     X_tr = torch.from_numpy(X_train.astype(np.float32)).to(device)
+    Xv_tensor = torch.from_numpy(X_val.astype(np.float32)).to(device) if X_val is not None else None
+
     y_tr_log = torch.from_numpy(y_train_log10.astype(np.float32)).to(device)
     FP_tr = torch.from_numpy(fp_train.astype(np.float32)).to(device)
     mech_tr = torch.from_numpy(mech_labels_train.astype(np.float32)).to(device)
@@ -695,21 +921,18 @@ def train_mflp_pinn(
         if X_val is not None and y_val_log10 is not None and fp_val is not None:
             with torch.no_grad():
                 model.eval()
-                Xv = torch.from_numpy(X_val.astype(np.float32)).to(device)
-                yv = torch.from_numpy(y_val_log10.astype(np.float32)).to(device)
-                FPv = torch.from_numpy(fp_val.astype(np.float32)).to(device)
-                if mtl_enabled and mech_labels_val is not None:
-                    Mechv = torch.from_numpy(mech_labels_val.astype(np.float32)).to(device)
+                if is_raw:
+                    Xv_input = Xv_tensor
                 else:
-                    Mechv = None
+                    Xv_input = Xv_tensor
 
                 if isinstance(model, MultiTaskMLP):
-                    mu_log_v, mech_prob_v = model(Xv)
+                    mu_log_v, mech_prob_v = model(Xv_input)
                 else:
-                    mu_log_v = model(Xv).squeeze(-1)
+                    mu_log_v = model(Xv_input).squeeze(-1)
                     mech_prob_v = torch.zeros_like(mu_log_v)
                 Np_v = torch.pow(10.0, mu_log_v)
-                v_data = F.mse_loss(mu_log_v, yv)
+                v_data = F.mse_loss(mu_log_v, y_v)
                 v_low = F.relu(-Np_v).mean() * float(lambda_nonneg)
                 v_high = F.relu(Np_v - float(upper_cycle_limit)).mean() * float(lambda_upper)
                 v_fs = fs_loss(Np_v, FPv, material_name) * float(lambda_fs)
@@ -730,7 +953,7 @@ def train_mflp_pinn(
                 model.train()
 
     model.eval()
-    return model, history
+    return model, history, raw_norm
 
 
 def predict_cycles(model: nn.Module, X: np.ndarray, device: torch.device) -> np.ndarray:
@@ -745,8 +968,17 @@ def predict_cycles(model: nn.Module, X: np.ndarray, device: torch.device) -> np.
         return Np_pred.detach().cpu().numpy().astype(np.float64)
 
 
-def predict_outputs(model: nn.Module, X: np.ndarray, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+def predict_outputs(
+    model: nn.Module,
+    X: np.ndarray,
+    device: torch.device,
+    *,
+    raw_norm: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     with torch.no_grad():
+        if raw_norm is not None:
+            mu, sigma = raw_norm
+            X = (X - mu) / sigma
         X_t = torch.from_numpy(X.astype(np.float32)).to(device)
         # 输出 mu_log = log10(Np)，再转回线性空间
         if isinstance(model, MultiTaskMLP):
@@ -1140,15 +1372,21 @@ def run_material_split(
     device: torch.device,
     mtl_enabled: bool,
     backbone: str,
+    use_raw_sequence: bool,
+    raw_seq_len: int,
 ):
     print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，Train/Test 分色)')
-    dataset = build_dataset(material, include_fp=include_fp)
+    dataset = build_dataset(
+        material,
+        include_fp=include_fp,
+        use_raw_sequence=use_raw_sequence,
+        raw_seq_len=raw_seq_len,
+    )
     X = dataset['X']
     y_log = dataset['y']  # log10(Nf)
     mu = dataset['mu']
     sigma = dataset['sigma']
 
-    # 标准化
     sigma_safe = np.where(sigma > 0, sigma, 1.0)
     Xz = (X - mu) / sigma_safe
 
@@ -1165,9 +1403,12 @@ def run_material_split(
     ], dtype=np.float64)
 
     # 训练
-    model, history = train_mflp_pinn(
+    model, history, raw_norm = train_mflp_pinn(
         X_train=Xz[train_idx],
         y_train_log10=y_log[train_idx],
+        is_raw=use_raw_sequence,
+        input_channels=dataset['input_channels'],
+        seq_len=dataset['seq_len'],
         hidden_dims=hidden_dims,
         dropout=dropout,
         lr=lr,
@@ -1186,7 +1427,6 @@ def run_material_split(
         grad_clip_norm=1.0,
         mtl_enabled=mtl_enabled,
         backbone=backbone,
-        # 验证集（用于绘制曲线）
         X_val=Xz[test_idx],
         y_val_log10=y_log[test_idx],
         fp_val=fp_all[test_idx],
@@ -1194,8 +1434,8 @@ def run_material_split(
     )
 
     # 预测（输出 cycles 与机制概率）
-    Np_tr, Mech_tr = predict_outputs(model, Xz[train_idx], device=device)
-    Np_te, Mech_te = predict_outputs(model, Xz[test_idx], device=device)
+    Np_tr, Mech_tr = predict_outputs(model, Xz[train_idx], device=device, raw_norm=raw_norm)
+    Np_te, Mech_te = predict_outputs(model, Xz[test_idx], device=device, raw_norm=raw_norm)
 
     evaluate_and_save_split(
         material,
@@ -1233,16 +1473,29 @@ def run_material_loo(
     device: torch.device,
     mtl_enabled: bool,
     backbone: str,
+    use_raw_sequence: bool,
+    raw_seq_len: int,
 ):
     print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，LOO)')
-    dataset = build_dataset(material, include_fp=include_fp)
+    dataset = build_dataset(
+        material,
+        include_fp=include_fp,
+        use_raw_sequence=use_raw_sequence,
+        raw_seq_len=raw_seq_len,
+    )
     X = dataset['X']
     y_log = dataset['y']
     mu = dataset['mu']
     sigma = dataset['sigma']
 
-    sigma_safe = np.where(sigma > 0, sigma, 1.0)
-    Xz = (X - mu) / sigma_safe
+    if use_raw_sequence:
+        mu = dataset['mu']
+        sigma = dataset['sigma']
+        sigma = np.where(sigma > 0, sigma, 1.0)
+        Xz = (X - mu) / sigma
+    else:
+        sigma_safe = np.where(sigma > 0, sigma, 1.0)
+        Xz = (X - mu) / sigma_safe
 
     n = Xz.shape[0]
     fp_all = np.array([m['FP'] for m in dataset['meta']], dtype=np.float64)
@@ -1267,9 +1520,12 @@ def run_material_loo(
             train_mask = ~test_mask
             if not np.any(test_mask):
                 continue
-            model, _ = train_mflp_pinn(
+            model, raw_history, raw_norm = train_mflp_pinn(
                 X_train=Xz[train_mask],
                 y_train_log10=y_log[train_mask],
+                is_raw=use_raw_sequence,
+                input_channels=dataset['input_channels'],
+                seq_len=dataset['seq_len'],
                 hidden_dims=hidden_dims,
                 dropout=dropout,
                 lr=lr,
@@ -1288,8 +1544,12 @@ def run_material_loo(
                 grad_clip_norm=1.0,
                 mtl_enabled=mtl_enabled,
                 backbone=backbone,
+                X_val=None,
+                y_val_log10=None,
+                fp_val=None,
+                mech_labels_val=None,
             )
-            Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[test_mask], device=device)
+            Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[test_mask], device=device, raw_norm=raw_norm)
             Np_pred_all[test_mask] = Np_pred_i.reshape(-1)
             Mech_prob_all[test_mask] = Mech_prob_i.reshape(-1)
             print(f"LOO(工况) 进度: {gi + 1}/{len(unique_groups)} - 留出: {gname}, 测试样本: {int(test_mask.sum())}")
@@ -1301,9 +1561,12 @@ def run_material_loo(
         for count, i in enumerate(order):
             mask = np.ones(n, dtype=bool)
             mask[i] = False
-            model, _ = train_mflp_pinn(
+            model, raw_history, raw_norm = train_mflp_pinn(
                 X_train=Xz[mask],
                 y_train_log10=y_log[mask],
+                is_raw=use_raw_sequence,
+                input_channels=dataset['input_channels'],
+                seq_len=dataset['seq_len'],
                 hidden_dims=hidden_dims,
                 dropout=dropout,
                 lr=lr,
@@ -1322,8 +1585,12 @@ def run_material_loo(
                 grad_clip_norm=1.0,
                 mtl_enabled=mtl_enabled,
                 backbone=backbone,
+                X_val=None,
+                y_val_log10=None,
+                fp_val=None,
+                mech_labels_val=None,
             )
-            Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device)
+            Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device, raw_norm=raw_norm)
             Np_pred_all[i] = float(Np_pred_i[0])
             Mech_prob_all[i] = float(Mech_prob_i[0])
             if (count + 1) % max(1, n // 10) == 0:
@@ -1354,6 +1621,11 @@ def main(args):
     include_fp = (not args.no_fp)
     mtl_enabled = (not args.no_mtl)
     backbone = args.backbone.lower()
+    use_raw_sequence = bool(args.raw_seq)
+    raw_seq_len = int(args.raw_seq_len)
+
+    if use_raw_sequence and backbone != 'transformer':
+        raise ValueError('Raw sequence模式仅支持transformer骨干')
 
     if args.material == 'ALL':
         materials = get_available_materials()
@@ -1382,6 +1654,8 @@ def main(args):
                         seed=int(args.seed),
                         device=dev,
                         backbone=backbone,
+                        use_raw_sequence=use_raw_sequence,
+                        raw_seq_len=raw_seq_len,
                     )
                 else:
                     run_material_split(
@@ -1403,6 +1677,8 @@ def main(args):
                         seed=int(args.seed),
                         device=dev,
                         backbone=backbone,
+                        use_raw_sequence=use_raw_sequence,
+                        raw_seq_len=raw_seq_len,
                     )
             except Exception as e:
                 print(f"处理 {mat} 时发生错误: {e}")
@@ -1426,6 +1702,8 @@ def main(args):
                 seed=int(args.seed),
                 device=dev,
                 backbone=backbone,
+                use_raw_sequence=use_raw_sequence,
+                raw_seq_len=raw_seq_len,
             )
         else:
             run_material_split(
@@ -1447,6 +1725,8 @@ def main(args):
                 seed=int(args.seed),
                 device=dev,
                 backbone=backbone,
+                use_raw_sequence=use_raw_sequence,
+                raw_seq_len=raw_seq_len,
             )
 
 parser = argparse.ArgumentParser(description='MFLP-PINN：基于物理约束的多轴疲劳寿命预测（时间序列特征）')
@@ -1471,6 +1751,8 @@ parser.add_argument('--lambda-mech', type=float, default=0.3, help='机制分类
 parser.add_argument('--no-mtl', action='store_true', help='关闭多任务（仅寿命预测）')
 parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
 parser.add_argument('--backbone', type=str, default='transformer', choices=['mlp', 'transformer'], help='选择回骨网络：mlp 或 transformer')
+parser.add_argument('--raw-seq', action='store_true', help='直接使用原始时间序列作为 Transformer 输入')
+parser.add_argument('--raw-seq-len', type=int, default=512, help='原始时间序列重采样长度（当 --raw-seq 生效时）')
 
 # 你运行哪个就保留哪个args，删掉其他两个
 # mlp
@@ -1487,4 +1769,15 @@ args = parser.parse_args(
 args = parser.parse_args(
     ["--epochs", "100", "--backbone", "transformer", "--method", "loo"]
 )
+
+# transformers + raw sequence
+args = parser.parse_args(
+    ["--epochs", "100", "--backbone", "transformer", "--raw-seq", "--method", "loo"]
+)
+
+# transformers + raw sequence + 多任务学习
+args = parser.parse_args(
+    ["--epochs", "100", "--backbone", "transformer", "--raw-seq", "--no-mtl", "--method", "loo"]
+)
+
 main(args)
