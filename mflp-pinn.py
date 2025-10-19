@@ -1476,7 +1476,7 @@ def run_material_loo(
     use_raw_sequence: bool,
     raw_seq_len: int,
 ):
-    print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，LOO)')
+    print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，标准LOO)')
     dataset = build_dataset(
         material,
         include_fp=include_fp,
@@ -1506,95 +1506,51 @@ def run_material_loo(
     Np_pred_all = np.zeros(n, dtype=np.float64)
     Mech_prob_all = np.zeros(n, dtype=np.float64)
 
-    # 基于工况（Excel 工作表名）进行分组 LOO。如果仅有一个工况，则退化为样本级 LOO。
-    groups_list = np.array([m.get('group', 'Unknown') for m in dataset['meta']], dtype=object)
-    unique_groups: list[str] = []
-    for g in groups_list:
-        if g not in unique_groups:
-            unique_groups.append(g)
-
-    if len(unique_groups) > 1:
-        print(f"检测到工况组: {', '.join(map(str, unique_groups))}")
-        for gi, gname in enumerate(unique_groups):
-            test_mask = (groups_list == gname)
-            train_mask = ~test_mask
-            if not np.any(test_mask):
-                continue
-            model, raw_history, raw_norm = train_mflp_pinn(
-                X_train=Xz[train_mask],
-                y_train_log10=y_log[train_mask],
-                is_raw=use_raw_sequence,
-                input_channels=dataset['input_channels'],
-                seq_len=dataset['seq_len'],
-                hidden_dims=hidden_dims,
-                dropout=dropout,
-                lr=lr,
-                weight_decay=weight_decay,
-                epochs=epochs,
-                batch_size=batch_size,
-                upper_cycle_limit=upper_cycle_limit,
-                lambda_nonneg=lambda_nonneg,
-                lambda_upper=lambda_upper,
-                lambda_fs=lambda_fs,
-                lambda_mech=lambda_mech,
-                fp_train=fp_all[train_mask],
-                mech_labels_train=mech_all[train_mask],
-                material_name=material,
-                device=device,
-                grad_clip_norm=1.0,
-                mtl_enabled=mtl_enabled,
-                backbone=backbone,
-                X_val=None,
-                y_val_log10=None,
-                fp_val=None,
-                mech_labels_val=None,
-            )
-            Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[test_mask], device=device, raw_norm=raw_norm)
-            Np_pred_all[test_mask] = Np_pred_i.reshape(-1)
-            Mech_prob_all[test_mask] = Mech_prob_i.reshape(-1)
-            print(f"LOO(工况) 进度: {gi + 1}/{len(unique_groups)} - 留出: {gname}, 测试样本: {int(test_mask.sum())}")
-    else:
-        rng = np.random.RandomState(int(seed))
-        order = np.arange(n)
-        rng.shuffle(order)
-        # 样本级 LOO
-        for count, i in enumerate(order):
-            mask = np.ones(n, dtype=bool)
-            mask[i] = False
-            model, raw_history, raw_norm = train_mflp_pinn(
-                X_train=Xz[mask],
-                y_train_log10=y_log[mask],
-                is_raw=use_raw_sequence,
-                input_channels=dataset['input_channels'],
-                seq_len=dataset['seq_len'],
-                hidden_dims=hidden_dims,
-                dropout=dropout,
-                lr=lr,
-                weight_decay=weight_decay,
-                epochs=epochs,
-                batch_size=batch_size,
-                upper_cycle_limit=upper_cycle_limit,
-                lambda_nonneg=lambda_nonneg,
-                lambda_upper=lambda_upper,
-                lambda_fs=lambda_fs,
-                lambda_mech=lambda_mech,
-                fp_train=fp_all[mask],
-                mech_labels_train=mech_all[mask],
-                material_name=material,
-                device=device,
-                grad_clip_norm=1.0,
-                mtl_enabled=mtl_enabled,
-                backbone=backbone,
-                X_val=None,
-                y_val_log10=None,
-                fp_val=None,
-                mech_labels_val=None,
-            )
-            Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device, raw_norm=raw_norm)
-            Np_pred_all[i] = float(Np_pred_i[0])
-            Mech_prob_all[i] = float(Mech_prob_i[0])
-            if (count + 1) % max(1, n // 10) == 0:
-                print(f'LOO 进度: {count + 1}/{n}')
+    # 使用标准的样本级LOO，不按工况分组
+    rng = np.random.RandomState(int(seed))
+    order = np.arange(n)
+    rng.shuffle(order)
+    
+    print(f"开始标准LOO训练，总样本数: {n}")
+    
+    # 样本级 LOO
+    for count, i in enumerate(order):
+        mask = np.ones(n, dtype=bool)
+        mask[i] = False
+        model, raw_history, raw_norm = train_mflp_pinn(
+            X_train=Xz[mask],
+            y_train_log10=y_log[mask],
+            is_raw=use_raw_sequence,
+            input_channels=dataset['input_channels'],
+            seq_len=dataset['seq_len'],
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            lr=lr,
+            weight_decay=weight_decay,
+            epochs=epochs,
+            batch_size=batch_size,
+            upper_cycle_limit=upper_cycle_limit,
+            lambda_nonneg=lambda_nonneg,
+            lambda_upper=lambda_upper,
+            lambda_fs=lambda_fs,
+            lambda_mech=lambda_mech,
+            fp_train=fp_all[mask],
+            mech_labels_train=mech_all[mask],
+            material_name=material,
+            device=device,
+            grad_clip_norm=1.0,
+            mtl_enabled=mtl_enabled,
+            backbone=backbone,
+            X_val=None,
+            y_val_log10=None,
+            fp_val=None,
+            mech_labels_val=None,
+        )
+        Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device, raw_norm=raw_norm)
+        Np_pred_all[i] = float(Np_pred_i[0])
+        Mech_prob_all[i] = float(Mech_prob_i[0])
+        if (count + 1) % max(1, n // 10) == 0:
+            print(f'LOO 进度: {count + 1}/{n}')
 
     evaluate_and_save_loo(
         material,
