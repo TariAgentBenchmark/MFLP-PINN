@@ -285,34 +285,49 @@ def build_dataset(
     *,
     use_raw_sequence: bool = False,
     raw_seq_len: int = 512,
+    baseline_mode: bool = False,
 ):
     strain_dir = get_strain_series_path(material_name)
     fatigue_path = get_fatigue_data_path(material_name)
-    if not os.path.exists(strain_dir):
-        raise FileNotFoundError(f'找不到应变时间序列文件夹: {strain_dir}')
     if not os.path.exists(fatigue_path):
         raise FileNotFoundError(f'找不到疲劳数据文件: {fatigue_path}')
 
-    # 预扫描时间序列 -> 特征
+    if baseline_mode and use_raw_sequence:
+        raise ValueError('基线模式仅支持基于幅值/FP的特征，无法与 raw sequence 同时使用')
+
     feature_map = {}
     file_map = {}
-    for fname in os.listdir(strain_dir):
-        if not (fname.startswith('strain_series_') and (fname.endswith('.xls') or fname.endswith('.csv'))):
-            continue
-        ea, ga = parse_strain_values_from_filename(fname)
-        key = (round(float(ea), 5), round(float(ga), 5))
-        path = os.path.join(strain_dir, fname)
-        time, normal, shear = read_strain_series(path)
-        if use_raw_sequence:
-            normal_rs = _resample_time_series(time, normal, raw_seq_len)
-            shear_rs = _resample_time_series(time, shear, raw_seq_len)
-            # (seq_len, channels)
-            stacked = np.stack([normal_rs, shear_rs], axis=1)
-            feature_map[key] = stacked
-        else:
-            feats = compute_features(time, normal, shear)
-            feature_map[key] = feats
-        file_map[key] = fname
+    strain_dir_exists = os.path.exists(strain_dir)
+
+    if baseline_mode:
+        # 仅解析文件名以便在输出时引用
+        if strain_dir_exists:
+            for fname in os.listdir(strain_dir):
+                if not (fname.startswith('strain_series_') and (fname.endswith('.xls') or fname.endswith('.csv'))):
+                    continue
+                ea, ga = parse_strain_values_from_filename(fname)
+                key = (round(float(ea), 5), round(float(ga), 5))
+                file_map[key] = fname
+    else:
+        if not strain_dir_exists:
+            raise FileNotFoundError(f'找不到应变时间序列文件夹: {strain_dir}')
+        for fname in os.listdir(strain_dir):
+            if not (fname.startswith('strain_series_') and (fname.endswith('.xls') or fname.endswith('.csv'))):
+                continue
+            ea, ga = parse_strain_values_from_filename(fname)
+            key = (round(float(ea), 5), round(float(ga), 5))
+            path = os.path.join(strain_dir, fname)
+            time, normal, shear = read_strain_series(path)
+            if use_raw_sequence:
+                normal_rs = _resample_time_series(time, normal, raw_seq_len)
+                shear_rs = _resample_time_series(time, shear, raw_seq_len)
+                # (seq_len, channels)
+                stacked = np.stack([normal_rs, shear_rs], axis=1)
+                feature_map[key] = stacked
+            else:
+                feats = compute_features(time, normal, shear)
+                feature_map[key] = feats
+            file_map[key] = fname
 
     eps_all, gam_all, Nf_all, FP_all, grp_all = read_fatigue_data(fatigue_path)
 
@@ -320,18 +335,22 @@ def build_dataset(
     meta = []
     for i in range(eps_all.size):
         key = (round(float(eps_all[i]), 5), round(float(gam_all[i]), 5))
-        if key not in feature_map:
-            continue
-        feats = feature_map[key]
-        if use_raw_sequence:
+        if baseline_mode:
+            feats = np.array([float(eps_all[i]), float(gam_all[i]), float(FP_all[i])], dtype=np.float64)
             X_list.append(feats)
         else:
-            # 将幅值与 FP 作为额外特征
-            extra = [float(eps_all[i]), float(gam_all[i])]
-            if include_fp:
-                extra.append(float(FP_all[i]))
-            x = np.concatenate([feats, np.array(extra, dtype=np.float64)])
-            X_list.append(x)
+            if key not in feature_map:
+                continue
+            feats = feature_map[key]
+            if use_raw_sequence:
+                X_list.append(feats)
+            else:
+                # 将幅值与 FP 作为额外特征
+                extra = [float(eps_all[i]), float(gam_all[i])]
+                if include_fp:
+                    extra.append(float(FP_all[i]))
+                x = np.concatenate([feats, np.array(extra, dtype=np.float64)])
+                X_list.append(x)
         y_list.append(math.log10(float(Nf_all[i])))
         meta.append({
             'file': file_map.get(key, ''),
@@ -1414,6 +1433,7 @@ def run_material_split(
     material: str,
     *,
     include_fp: bool,
+    baseline_mode: bool,
     hidden_dims: list[int],
     dropout: float,
     lr: float,
@@ -1433,12 +1453,14 @@ def run_material_split(
     use_raw_sequence: bool,
     raw_seq_len: int,
 ):
-    print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，Train/Test 分色)')
+    mode_desc = '幅值+FP 基线' if baseline_mode else '时间序列特征'
+    print(f'开始处理材料: {material} (MFLP-PINN + {mode_desc}，Train/Test 分色)')
     dataset = build_dataset(
         material,
         include_fp=include_fp,
         use_raw_sequence=use_raw_sequence,
         raw_seq_len=raw_seq_len,
+        baseline_mode=baseline_mode,
     )
     X = dataset['X']
     y_log = dataset['y']  # log10(Nf)
@@ -1516,6 +1538,7 @@ def run_material_loo(
     material: str,
     *,
     include_fp: bool,
+    baseline_mode: bool,
     hidden_dims: list[int],
     dropout: float,
     lr: float,
@@ -1534,12 +1557,14 @@ def run_material_loo(
     use_raw_sequence: bool,
     raw_seq_len: int,
 ):
-    print(f'开始处理材料: {material} (MFLP-PINN + 时间序列特征，标准LOO)')
+    mode_desc = '幅值+FP 基线' if baseline_mode else '时间序列特征'
+    print(f'开始处理材料: {material} (MFLP-PINN + {mode_desc}，标准 LOO)')
     dataset = build_dataset(
         material,
         include_fp=include_fp,
         use_raw_sequence=use_raw_sequence,
         raw_seq_len=raw_seq_len,
+        baseline_mode=baseline_mode,
     )
     X = dataset['X']
     y_log = dataset['y']
@@ -1644,11 +1669,20 @@ def main(args):
     dev = torch.device('cuda' if (args.device == 'cuda' or (args.device == 'auto' and torch.cuda.is_available())) else 'cpu')
     hidden_dims = parse_hidden_dims(args.hidden_dims)
 
+    baseline_mode = bool(args.baseline)
     include_fp = (not args.no_fp)
+    if baseline_mode:
+        if args.no_fp:
+            print('警告: 基线模式需要 FP 特征，--no-fp 将被忽略。')
+        include_fp = True
+
     mtl_enabled = (not args.no_mtl)
     backbone = args.backbone.lower()
     use_raw_sequence = bool(args.raw_seq)
     raw_seq_len = int(args.raw_seq_len)
+
+    if baseline_mode and use_raw_sequence:
+        raise ValueError('基线模式仅支持幅值+FP 输入，请勿同时启用 --raw-seq')
 
     if use_raw_sequence and backbone != 'transformer':
         raise ValueError('Raw sequence模式仅支持transformer骨干')
@@ -1665,6 +1699,7 @@ def main(args):
                     run_material_loo(
                         mat,
                         include_fp=include_fp,
+                        baseline_mode=baseline_mode,
                         hidden_dims=hidden_dims,
                         dropout=float(args.dropout),
                         lr=float(args.lr),
@@ -1687,6 +1722,7 @@ def main(args):
                     run_material_split(
                         mat,
                         include_fp=include_fp,
+                        baseline_mode=baseline_mode,
                         hidden_dims=hidden_dims,
                         dropout=float(args.dropout),
                         lr=float(args.lr),
@@ -1713,6 +1749,7 @@ def main(args):
             run_material_loo(
                 args.material,
                 include_fp=include_fp,
+                baseline_mode=baseline_mode,
                 hidden_dims=hidden_dims,
                 dropout=float(args.dropout),
                 lr=float(args.lr),
@@ -1735,6 +1772,7 @@ def main(args):
             run_material_split(
                 args.material,
                 include_fp=include_fp,
+                baseline_mode=baseline_mode,
                 hidden_dims=hidden_dims,
                 dropout=float(args.dropout),
                 lr=float(args.lr),
@@ -1755,9 +1793,10 @@ def main(args):
                 raw_seq_len=raw_seq_len,
             )
 
-parser = argparse.ArgumentParser(description='MFLP-PINN：基于物理约束的多轴疲劳寿命预测（时间序列特征）')
+parser = argparse.ArgumentParser(description='MFLP-PINN：基于物理约束的多轴疲劳寿命预测（可选时间序列特征/基线）')
 parser.add_argument('--material', type=str, default='ALL', choices=['ALL'] + list(DATA_DIRS.keys()))
 parser.add_argument('--no-fp', action='store_true', help='不使用疲劳参数 FP 作为特征')
+parser.add_argument('--baseline', action='store_true', help='启用仅基于幅值与 FP 的基线，不提取时间序列特征')
 parser.add_argument('--method', type=str, default='split', choices=['split', 'loo'], help='预测方式：split 或 loo')
 parser.add_argument('--test-ratio', type=float, default=0.2, help='测试集比例（split 模式）')
 parser.add_argument('--seed', type=int, default=42, help='随机种子')
@@ -1804,6 +1843,20 @@ args = parser.parse_args(
 # transformers + raw sequence + 多任务学习
 args = parser.parse_args(
     ["--epochs", "100", "--backbone", "transformer", "--raw-seq", "--no-mtl", "--method", "loo"]
+)
+
+# baseline 运行极限（仅幅值+FP，MLP 骨干）
+args = parser.parse_args(
+    [
+        "--material", "ALL",
+        "--method", "split",
+        "--baseline",
+        "--backbone", "mlp",
+        "--no-mtl",
+        "--epochs", "200",
+        "--batch-size", "64",
+        "--lr", "5e-4"
+    ]
 )
 
 main(args)
