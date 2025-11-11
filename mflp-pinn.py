@@ -852,8 +852,13 @@ def train_mflp_pinn(
     Xv_tensor = torch.from_numpy(X_val.astype(np.float32)).to(device) if X_val is not None else None
 
     y_tr_log = torch.from_numpy(y_train_log10.astype(np.float32)).to(device)
+    y_v = torch.from_numpy(y_val_log10.astype(np.float32)).to(device) if y_val_log10 is not None else None
+
     FP_tr = torch.from_numpy(fp_train.astype(np.float32)).to(device)
+    FPv = torch.from_numpy(fp_val.astype(np.float32)).to(device) if fp_val is not None else None
+
     mech_tr = torch.from_numpy(mech_labels_train.astype(np.float32)).to(device)
+    Mechv = torch.from_numpy(mech_labels_val.astype(np.float32)).to(device) if mech_labels_val is not None else None
 
     num_samples = X_tr.shape[0]
     num_batches = max(1, int(math.ceil(num_samples / max(1, batch_size))))
