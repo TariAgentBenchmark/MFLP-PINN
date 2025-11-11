@@ -1031,6 +1031,64 @@ def plot_loss_history(material: str, history: dict):
     print(f'训练/验证损失曲线已保存: {plot_path}')
 
 
+def plot_loo_loss_history(material: str, all_histories: list[dict]):
+    """绘制LOOCV训练的平均损失函数图像"""
+    if not all_histories:
+        return
+    
+    # 计算平均损失历史
+    avg_history = {}
+    for key in ['train_total', 'train_data', 'train_phys', 'train_mech']:
+        if key in all_histories[0]:
+            # 找到所有历史中最长的epoch数
+            max_epochs = max(len(h[key]) for h in all_histories)
+            avg_values = []
+            for epoch in range(max_epochs):
+                epoch_values = []
+                for h in all_histories:
+                    if epoch < len(h[key]):
+                        epoch_values.append(h[key][epoch])
+                if epoch_values:
+                    avg_values.append(np.mean(epoch_values))
+            avg_history[key] = avg_values
+    
+    # 绘制平均损失曲线
+    if avg_history and len(avg_history.get('train_total', [])) > 0:
+        epochs = np.arange(1, len(avg_history['train_total']) + 1)
+        plt.figure(figsize=(12, 8))
+        
+        # 绘制平均损失
+        plt.plot(epochs, avg_history['train_total'], color='blue', linewidth=3.0, label='Avg Train Total Loss', alpha=0.9)
+        
+        # 绘制各个损失分量
+        if len(avg_history.get('train_data', [])) == len(epochs):
+            plt.plot(epochs, avg_history['train_data'], color='red', linestyle='--', linewidth=2.0, label='Avg Train Data Loss', alpha=0.8)
+        
+        if len(avg_history.get('train_phys', [])) == len(epochs):
+            plt.plot(epochs, avg_history['train_phys'], color='green', linestyle=':', linewidth=2.5, label='Avg Train Physical Loss', alpha=0.8)
+        
+        if len(avg_history.get('train_mech', [])) == len(epochs):
+            plt.plot(epochs, avg_history['train_mech'], color='purple', linestyle='-.', linewidth=2.0, label='Avg Train Mech Loss', alpha=0.8)
+        
+        # 绘制所有fold的损失曲线（透明度较低）
+        for i, history in enumerate(all_histories):
+            if 'train_total' in history and len(history['train_total']) > 0:
+                fold_epochs = np.arange(1, len(history['train_total']) + 1)
+                plt.plot(fold_epochs, history['train_total'], color='gray', linewidth=0.5, alpha=0.2)
+        
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss Value')
+        plt.title(f'{material} LOOCV Training Loss History\n(Average over {len(all_histories)} folds)')
+        plt.grid(True, alpha=0.5)
+        plt.legend()
+        
+        # 保存图像
+        plot_path = get_output_path(material, f'{material}_loo_loss_history.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f'LOOCV训练损失曲线已保存: {plot_path}')
+
+
 def _compute_binary_metrics(y_true_soft: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
     """针对机制预测的软标签计算主要二分类指标。"""
     mask = y_true_soft >= 0.0
@@ -1513,6 +1571,9 @@ def run_material_loo(
     
     print(f"开始标准LOO训练，总样本数: {n}")
     
+    # 收集所有fold的损失历史
+    all_histories = []
+    
     # 样本级 LOO
     for count, i in enumerate(order):
         mask = np.ones(n, dtype=bool)
@@ -1549,8 +1610,17 @@ def run_material_loo(
         Np_pred_i, Mech_prob_i = predict_outputs(model, Xz[i:i+1], device=device, raw_norm=raw_norm)
         Np_pred_all[i] = float(Np_pred_i[0])
         Mech_prob_all[i] = float(Mech_prob_i[0])
+        
+        # 保存当前fold的损失历史
+        if raw_history and len(raw_history.get('train_total', [])) > 0:
+            all_histories.append(raw_history)
+        
         if (count + 1) % max(1, n // 10) == 0:
             print(f'LOO 进度: {count + 1}/{n}')
+    
+    # 绘制平均损失函数图像
+    if all_histories:
+        plot_loo_loss_history(material, all_histories)
 
     evaluate_and_save_loo(
         material,
